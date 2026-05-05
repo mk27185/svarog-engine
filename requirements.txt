@@ -1,10 +1,15 @@
 requests
 python-dotenv
 numpy
-pillow
-rasterio
-trimesh
 scipy
-affine
 rasterio
+affine
+pillow
 trimesh
+triangle
+shapely
+
+# GPU acceleration (RTX 3090, CUDA driver 13.2 je zpětně kompatibilní s cupy-cuda12x)
+# Pokud instalace selže, zkus: pip install cupy-cuda13x
+cupy-cuda12x
+nvidia-cuda-nvrtc-cu12

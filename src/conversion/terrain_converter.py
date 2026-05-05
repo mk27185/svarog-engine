@@ -1,69 +1,101 @@
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import zoom as ndimage_zoom
 import os
-import math
+
+from .geo_utils import build_meta
+
 
 class TerrainConverter:
 
-    def __init__(self, output_dir="outputs"):
+    def __init__(self, output_dir: str = "outputs"):
         self.output_dir = output_dir
 
-    @staticmethod
-    def interpolate_corners(elevation_array):
-        h, w = elevation_array.shape
-        # body s realnymi hodnotami v centrech pixelu: (0.5, 0.5), ..., (h-0.5, w-0.5)
-        src_r = np.arange(0.5, h, 1)
-        src_c = np.arange(0.5, w, 1)
+    def build_grid(
+        self,
+        tif_path: str,
+        upsample_factor: int = 1,
+    ) -> tuple[np.ndarray, dict]:
+        """
+        Read GeoTIFF → (z_grid, meta).
 
-        interp = RegularGridInterpolator((src_r, src_c), elevation_array, method='linear', bounds_error=False, fill_value=None)
+        upsample_factor : integer ≥ 1.
+            Uses bilinear interpolation (order=1) — no overshoot artifacts.
+            SRTM is 30 m; factor=10 → ~2–3 m, factor=20 → ~1–1.5 m.
+            Above 20 adds no real elevation information from SRTM.
 
-        r_corners = np.arange(0, h + 1)
-        c_corners = np.arange(0, w + 1)
-        rr, cc = np.meshgrid(r_corners, c_corners, indexing='ij')
-        pts = np.stack([rr.ravel(), cc.ravel()], axis=-1)
-
-        z_corners = interp(pts).reshape(h + 1, w + 1)
-        return z_corners
-
-    def convert_tif_to_obj(self, tif_path, obj_name=None, output_dir=None):
-        output_dir = output_dir or self.output_dir
+        z_grid : (h+1, w+1) float32, corner-interpolated elevation
+                 row 0 = north edge, row h = south edge
+        meta   : shared geometry metadata (see geo_utils.build_meta)
+        """
         if not os.path.exists(tif_path):
             raise FileNotFoundError(f"TIF soubor neexistuje: {tif_path}")
-        os.makedirs(output_dir, exist_ok=True)
 
         import rasterio
+        from rasterio.transform import from_bounds as tf_from_bounds
+
         with rasterio.open(tif_path) as src:
             elevation = src.read(1).astype(np.float32)
+            bounds    = src.bounds
             transform = src.transform
-            h, w = elevation.shape
-            bounds = src.bounds
 
-        # Převod na lokální metrické souřadnice (počátek = jihozápadní roh bbox)
-        # 1° zeměpisné šířky ≈ 111 320 m; 1° délky závisí na šířce
-        lat_origin = bounds.bottom
-        lon_origin = bounds.left
-        lat_mean_rad = math.radians((bounds.bottom + bounds.top) / 2)
-        meters_per_deg_lat = 111_320.0
-        meters_per_deg_lon = 111_320.0 * math.cos(lat_mean_rad)
+        if upsample_factor > 1:
+            # order=1 = bilinear — guaranteed no overshoot / false valleys
+            elevation = ndimage_zoom(
+                elevation, upsample_factor, order=1, mode="reflect"
+            )
+            new_h, new_w = elevation.shape
+            transform = tf_from_bounds(
+                bounds.left, bounds.bottom, bounds.right, bounds.top,
+                new_w, new_h,
+            )
 
-        z_grid = TerrainConverter.interpolate_corners(elevation)
+        meta   = build_meta(bounds, transform)
+        z_grid = self._interpolate_corners(elevation)
 
-        output_file = (
-            os.path.join(output_dir, f"{obj_name}.obj")
-            if obj_name
-            else os.path.join(output_dir, os.path.splitext(os.path.basename(tif_path))[0] + ".obj")
+        cw = meta["cell_width_m"]
+        ch = meta["cell_height_m"]
+        print(
+            f"   Terrain grid: {meta['h']}×{meta['w']} buněk  "
+            f"({cw:.1f}×{ch:.1f} m/buňka)  "
+            f"[upsample {upsample_factor}×]"
         )
+        return z_grid, meta
 
-        with open(output_file, 'w') as f:
-            f.write("# OBJ Mesh – local metric coords (origin = SW corner of bbox), units: meters\n")
-            f.write(f"# Origin: lon={lon_origin:.6f}, lat={lat_origin:.6f}\n")
+    def write_obj(
+        self,
+        z_grid:     np.ndarray,
+        meta:       dict,
+        obj_name:   str | None = None,
+        output_dir: str | None = None,
+    ) -> str:
+        """Write plain terrain OBJ (regular quad grid, no road modification)."""
+        output_dir  = output_dir or self.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        h, w       = meta["h"], meta["w"]
+        transform  = meta["transform"]
+        lon_origin = meta["lon_origin"]
+        lat_origin = meta["lat_origin"]
+        mpd_lon    = meta["meters_per_deg_lon"]
+        mpd_lat    = meta["meters_per_deg_lat"]
+
+        fname       = f"{obj_name}.obj" if obj_name else "terrain.obj"
+        output_file = os.path.join(output_dir, fname)
+
+        with open(output_file, "w") as f:
+            f.write("# Terrain OBJ – local metric coords (origin = SW corner)\n")
+            f.write(
+                f"# Origin: lon={lon_origin:.6f}, lat={lat_origin:.6f}  "
+                f"grid={h}×{w}  cell={meta['cell_width_m']:.2f}×"
+                f"{meta['cell_height_m']:.2f} m\n"
+            )
             for r in range(h + 1):
                 for c in range(w + 1):
                     lon, lat = transform * (c, r)
-                    x = (lon - lon_origin) * meters_per_deg_lon
-                    y = (lat - lat_origin) * meters_per_deg_lat
-                    z = float(z_grid[r, c])
-                    f.write(f"v {x:.3f} {y:.3f} {z:.3f}\n")
+                    x = (lon - lon_origin) * mpd_lon
+                    y = (lat - lat_origin) * mpd_lat
+                    f.write(f"v {x:.3f} {y:.3f} {float(z_grid[r,c]):.3f}\n")
 
             for r in range(h):
                 for c in range(w):
@@ -71,7 +103,31 @@ class TerrainConverter:
                     v2 = v1 + 1
                     v3 = v1 + (w + 1)
                     v4 = v3 + 1
-                    f.write(f"f {v1} {v2} {v3}\n")
-                    f.write(f"f {v2} {v4} {v3}\n")
+                    f.write(f"f {v1} {v2} {v3}\nf {v2} {v4} {v3}\n")
 
+        total = h * w * 2
+        print(f"   Terrain OBJ: {output_file}  ({(h+1)*(w+1):,} vrcholů, {total:,} faces)")
         return output_file
+
+    def convert_tif_to_obj(
+        self,
+        tif_path:        str,
+        obj_name:        str | None = None,
+        output_dir:      str | None = None,
+        upsample_factor: int = 1,
+    ) -> str:
+        z_grid, meta = self.build_grid(tif_path, upsample_factor=upsample_factor)
+        return self.write_obj(z_grid, meta, obj_name, output_dir)
+
+    @staticmethod
+    def _interpolate_corners(elevation: np.ndarray) -> np.ndarray:
+        h, w   = elevation.shape
+        src_r  = np.arange(0.5, h, 1.0)
+        src_c  = np.arange(0.5, w, 1.0)
+        interp = RegularGridInterpolator(
+            (src_r, src_c), elevation,
+            method="linear", bounds_error=False, fill_value=None,
+        )
+        rr, cc = np.meshgrid(np.arange(h + 1), np.arange(w + 1), indexing="ij")
+        pts    = np.stack([rr.ravel(), cc.ravel()], axis=-1)
+        return interp(pts).reshape(h + 1, w + 1).astype(np.float32)
