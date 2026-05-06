@@ -41,7 +41,7 @@ import math
 import numpy as np
 from scipy.ndimage import maximum_filter, uniform_filter, uniform_filter1d
 
-from .geo_utils import to_local, sample_z
+from .geo_utils import to_local, sample_z, subdivide_polyline
 from .terrain_stamper import ROAD_HALF_WIDTHS, DEFAULT_HALF_WIDTH
 
 Z_TOP_OFFSET = 0.20    # m – road surface above terrain
@@ -87,7 +87,7 @@ class RoadMesh:
             half_w = self._half_width(tags)
 
             pts_local = [to_local(lon, lat, meta) for lon, lat in nodes]
-            pts       = self._subdivide(pts_local)
+            pts       = subdivide_polyline(pts_local, self.subdivision_step)
             if len(pts) < 2:
                 continue
 
@@ -262,23 +262,6 @@ class RoadMesh:
     # ------------------------------------------------------------------ #
     # Geometry helpers                                                     #
     # ------------------------------------------------------------------ #
-
-    def _subdivide(self, local_nodes: list[tuple]) -> list[tuple]:
-        step = self.subdivision_step
-        pts: list[tuple] = []
-        for i in range(len(local_nodes) - 1):
-            x0, y0 = local_nodes[i]
-            x1, y1 = local_nodes[i + 1]
-            L = math.hypot(x1 - x0, y1 - y0)
-            if L < 1e-6:
-                continue
-            n = max(1, math.ceil(L / step))
-            for j in range(n):
-                t = j / n
-                pts.append((x0 + t*(x1-x0), y0 + t*(y1-y0)))
-        if local_nodes:
-            pts.append(local_nodes[-1])
-        return pts
 
     @staticmethod
     def _miter_normals(pts: np.ndarray, half_w: float) -> np.ndarray:

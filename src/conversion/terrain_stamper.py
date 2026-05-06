@@ -21,9 +21,8 @@ is computed on the GPU.  Falls back to NumPy automatically.
 
 import math
 import numpy as np
-from scipy.ndimage import uniform_filter1d
 
-from .geo_utils import build_meta, to_local, sample_z
+from .geo_utils import build_meta, to_local, sample_z, subdivide_polyline, smooth_profile
 
 # Road half-widths by OSM highway tag (metres)
 ROAD_HALF_WIDTHS: dict[str, float] = {
@@ -107,7 +106,7 @@ class TerrainStamper:
             half_w   = self._half_width(tags, hw_type)
 
             local_nodes = [to_local(lon, lat, meta) for lon, lat in nodes]
-            pts         = self._subdivide(local_nodes)
+            pts         = subdivide_polyline(local_nodes, self.subdivision_step)
             if len(pts) < 1:
                 continue
 
@@ -115,7 +114,7 @@ class TerrainStamper:
 
             z_raw    = np.array([sample_z(x, y, z_grid, meta) for x, y in pts],
                                 dtype=np.float32)
-            z_smooth = self._smooth(z_raw)
+            z_smooth = smooth_profile(z_raw, SMOOTH_WINDOW)
 
             road_xy_list.append(pts_arr)
             road_z_list.append(z_smooth)
@@ -212,31 +211,6 @@ class TerrainStamper:
         except (ValueError, TypeError):
             pass
         return ROAD_HALF_WIDTHS.get(hw_type, DEFAULT_HALF_WIDTH)
-
-    def _subdivide(self, local_nodes: list[tuple]) -> list[tuple]:
-        """Subdivide polyline so consecutive points are ≤ subdivision_step apart."""
-        step = self.subdivision_step
-        pts: list[tuple] = []
-        for i in range(len(local_nodes) - 1):
-            x0, y0 = local_nodes[i]
-            x1, y1 = local_nodes[i + 1]
-            L = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
-            if L < 1e-6:
-                continue
-            n = max(1, math.ceil(L / step))
-            for j in range(n):
-                t = j / n
-                pts.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
-        if local_nodes:
-            pts.append(local_nodes[-1])
-        return pts
-
-    @staticmethod
-    def _smooth(zs: np.ndarray) -> np.ndarray:
-        if len(zs) < 3:
-            return zs
-        window = min(SMOOTH_WINDOW, len(zs))
-        return uniform_filter1d(zs, size=window, mode="nearest").astype(np.float32)
 
     @staticmethod
     def _init_backend(use_gpu: bool):

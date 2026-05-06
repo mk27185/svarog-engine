@@ -10,6 +10,47 @@ Local metric coordinate system:
 import math
 import numpy as np
 
+# Minimum segment length to subdivide (metres)
+_MIN_SEGMENT = 1e-6
+
+
+def smooth_profile(zs: np.ndarray, window: int = 10) -> np.ndarray:
+    """
+    Smooth a 1-D elevation profile using a uniform filter.
+
+    Profiles shorter than 3 points are returned unchanged.  The effective
+    window is clamped to ``len(zs)`` so edge artefacts are avoided.
+    """
+    if len(zs) < 3:
+        return zs
+    w = min(max(1, window), len(zs))
+    from scipy.ndimage import uniform_filter1d
+    return uniform_filter1d(zs, size=w, mode="nearest")
+
+
+def subdivide_polyline(local_nodes: list[tuple], step: float) -> list[tuple]:
+    """
+    Subdivide a polyline so that consecutive points are at most ``step``
+    metres apart.
+
+    Segments shorter than ``_MIN_SEGMENT`` are skipped (the start point is
+    omitted; the end point is always emitted via the final append).
+    """
+    pts: list[tuple] = []
+    for i in range(len(local_nodes) - 1):
+        x0, y0 = local_nodes[i]
+        x1, y1 = local_nodes[i + 1]
+        L = math.hypot(x1 - x0, y1 - y0)
+        if L < _MIN_SEGMENT:
+            continue
+        n = max(1, math.ceil(L / step))
+        for j in range(n):
+            t = j / n
+            pts.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
+    if local_nodes:
+        pts.append(local_nodes[-1])
+    return pts
+
 
 def build_meta(bounds, transform) -> dict:
     """Build the shared grid metadata dict from rasterio bounds + transform."""

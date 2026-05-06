@@ -27,6 +27,7 @@ class TerrainPipeline:
         road_mesh,
         osm_client        = None,
         building_extruder = None,
+        sdf_generator     = None,
         upsample_factor:    int = UPSAMPLE_FACTOR,
     ):
         self.client            = client
@@ -34,6 +35,7 @@ class TerrainPipeline:
         self.road_mesh         = road_mesh
         self.osm_client        = osm_client
         self.building_extruder = building_extruder
+        self.sdf_generator     = sdf_generator
         self.upsample_factor   = upsample_factor
 
     def run_pipeline(self, bbox: tuple, output_base_name: str) -> dict:
@@ -42,7 +44,12 @@ class TerrainPipeline:
         print(f"  Upsample: {self.upsample_factor}×")
         print(f"{'='*60}")
 
-        result = {"terrain": None, "roads": None, "buildings": None}
+        result = {
+            "terrain": None,
+            "roads": None,
+            "buildings": None,
+            "sdf_texture": None,
+        }
 
         # ── 1. DEM ────────────────────────────────────────────────────────
         print("\n[1/5] Stahuji DEM...")
@@ -67,9 +74,14 @@ class TerrainPipeline:
         )
 
         # ── 3. Terrain OBJ ────────────────────────────────────────────────
-        print("\n[3/5] Zapisuji terrain OBJ...")
+        print("\n[3/6] Zapisuji terrain OBJ...")
         try:
-            terrain_path = self.converter.write_obj(
+            use_uv = self.sdf_generator is not None
+            writer = (
+                self.converter.write_obj_with_uv if use_uv
+                else self.converter.write_obj
+            )
+            terrain_path = writer(
                 z_grid, meta, obj_name=f"{output_base_name}_terrain"
             )
             result["terrain"] = terrain_path
@@ -81,13 +93,26 @@ class TerrainPipeline:
         # ── 4. OSM highways ──────────────────────────────────────────────
         highways: list = []
         if self.osm_client:
-            print("\n[4/5] Stahuji OSM silnice + budovy...")
+            print("\n[4/6] Stahuji OSM silnice + budovy...")
             highways = self.osm_client.get_highways(bbox)
             print(f"  ✓ {len(highways)} silnic")
 
-        # ── 5. Road 3D OBJ ───────────────────────────────────────────────
+        # ── 4b. SDF road texture ─────────────────────────────────────────
+        if self.sdf_generator and highways:
+            print("\n[4b/6] Generuji SDF texturu silnic...")
+            try:
+                sdf_path = os.path.join(
+                    self.converter.output_dir, f"{output_base_name}_roads_sdf.png"
+                )
+                self.sdf_generator.generate(highways, meta, sdf_path)
+                result["sdf_texture"] = sdf_path
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"  ✗ SDF selhal: {e}")
+
+        # ── 5. Road 3D OBJ ──────────────────────────────────────────────
         if self.road_mesh and highways:
-            print("\n[5/5] Road 3D OBJ (top + side walls)...")
+            print("\n[5/6] Road 3D OBJ (top + side walls)...")
             try:
                 road_path = self.road_mesh.generate_obj(
                     highways, z_grid, meta,
@@ -116,7 +141,7 @@ class TerrainPipeline:
         print(f"\n{'='*60}")
         print("  PIPELINE HOTOV")
         for k, v in result.items():
-            print(f"    {k:12s}: {v or '—'}")
+            print(f"    {k:12s}: {v or '--'}")
         print(f"{'='*60}\n")
         return result
 
