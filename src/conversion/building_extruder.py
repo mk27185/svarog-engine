@@ -22,6 +22,21 @@ class BuildingExtruder:
     # Public API
     # ------------------------------------------------------------------
 
+    def generate(
+        self,
+        buildings: list[dict],
+        z_grid,
+        meta: dict,
+        *,
+        obj_name: str | None = None,
+        output_dir: str | None = None,
+    ) -> str:
+        """Plug-in compatible interface (BuildingPlugin protocol)."""
+        return self.extrude_buildings(
+            buildings, z_grid, meta,
+            obj_name=obj_name, output_dir=output_dir,
+        )
+
     def extrude_buildings(
         self,
         buildings: list[dict],
@@ -69,20 +84,20 @@ class BuildingExtruder:
             # Sample terrain at every footprint vertex; use minimum so the
             # building never floats above the highest ground corner.
             corner_zs = [
-                sample_z(*to_local(lon, lat, meta), z_grid, meta)
-                for lon, lat in nodes
+                sample_z(*to_local(n["lon"], n["lat"], meta), z_grid, meta)
+                for n in nodes
             ]
             base_z = min(corner_zs)
             top_z   = base_z + height
             n_nodes = len(nodes)
 
             base_start = len(all_vertices)
-            for lon, lat in nodes:
-                x, y = to_local(lon, lat, meta)
+            for n in nodes:
+                x, y = to_local(n["lon"], n["lat"], meta)
                 all_vertices.append((x, y, base_z))
             top_start = len(all_vertices)
-            for lon, lat in nodes:
-                x, y = to_local(lon, lat, meta)
+            for n in nodes:
+                x, y = to_local(n["lon"], n["lat"], meta)
                 all_vertices.append((x, y, top_z))
 
             # Walls

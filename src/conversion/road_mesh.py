@@ -63,11 +63,12 @@ class RoadMesh:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def generate_obj(
+    def generate(
         self,
         highways:   list[dict],
         z_grid:     np.ndarray,
         meta:       dict,
+        *,
         obj_name:   str | None = None,
         output_dir: str | None = None,
     ) -> str:
@@ -86,7 +87,7 @@ class RoadMesh:
             tags   = road.get("tags", {})
             half_w = self._half_width(tags)
 
-            pts_local = [to_local(lon, lat, meta) for lon, lat in nodes]
+            pts_local = [to_local(n["lon"], n["lat"], meta) for n in nodes]
             pts       = subdivide_polyline(pts_local, self.subdivision_step)
             if len(pts) < 2:
                 continue
@@ -174,6 +175,9 @@ class RoadMesh:
             f"({len(all_verts):,} vrcholů, {len(all_faces):,} faces)"
         )
         return out
+
+    # Backward-compatible alias kept for existing callers
+    generate_obj = generate
 
     # ------------------------------------------------------------------ #
     # Junction Z reconciliation                                            #

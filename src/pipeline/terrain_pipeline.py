@@ -12,8 +12,19 @@ Outputs (all in output_dir):
   <base>_terrain.obj     ← plain smooth terrain
   <base>_roads.obj       ← 3-D road strips with side walls
   <base>_buildings.obj   ← extruded OSM buildings
+
+Plug-in contract
+----------------
+`road_mesh` must satisfy RoadPlugin (has `generate(highways, z_grid, meta, *, obj_name, output_dir)`).
+`building_extruder` must satisfy BuildingPlugin (has `generate(buildings, z_grid, meta, *, obj_name, output_dir)`).
+Both are @runtime_checkable Protocols — pass any conforming object, not just the built-ins.
 """
+from __future__ import annotations
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.conversion.plugin import RoadPlugin, BuildingPlugin
 
 UPSAMPLE_FACTOR = 10   # 30 m SRTM → ≈ 3 m grid  (try 20 for ≈ 1.5 m)
 
@@ -24,11 +35,11 @@ class TerrainPipeline:
         self,
         client,
         converter,
-        road_mesh,
-        osm_client        = None,
-        building_extruder = None,
-        sdf_generator     = None,
-        upsample_factor:    int = UPSAMPLE_FACTOR,
+        road_mesh:         "RoadPlugin | None"     = None,
+        osm_client                                 = None,
+        building_extruder: "BuildingPlugin | None" = None,
+        sdf_generator                              = None,
+        upsample_factor:   int                     = UPSAMPLE_FACTOR,
     ):
         self.client            = client
         self.converter         = converter
@@ -114,7 +125,7 @@ class TerrainPipeline:
         if self.road_mesh and highways:
             print("\n[5/6] Road 3D OBJ (top + side walls)...")
             try:
-                road_path = self.road_mesh.generate_obj(
+                road_path = self.road_mesh.generate(
                     highways, z_grid, meta,
                     obj_name=output_base_name,
                 )
@@ -130,7 +141,7 @@ class TerrainPipeline:
             if buildings:
                 print(f"\n[6] Budovy ({len(buildings)})...")
                 try:
-                    bld_path = self.building_extruder.extrude_buildings(
+                    bld_path = self.building_extruder.generate(
                         buildings, z_grid, meta, obj_name=output_base_name
                     )
                     result["buildings"] = bld_path

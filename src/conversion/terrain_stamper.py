@@ -105,7 +105,7 @@ class TerrainStamper:
             hw_type  = tags.get("highway", "")
             half_w   = self._half_width(tags, hw_type)
 
-            local_nodes = [to_local(lon, lat, meta) for lon, lat in nodes]
+            local_nodes = [to_local(n["lon"], n["lat"], meta) for n in nodes]
             pts         = subdivide_polyline(local_nodes, self.subdivision_step)
             if len(pts) < 1:
                 continue
