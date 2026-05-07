@@ -25,17 +25,26 @@ class TestTileSplitter:
 
     def test_xyz_grid_covers_bbox(self):
         bbox = (50.07, 14.43, 50.09, 14.46)
-        tiles = TileSplitter.xyz_grid(bbox, zoom=15)
+        # tile_size_m=720 → zoom 15 at Prague latitude
+        tiles = TileSplitter.xyz_grid(bbox, tile_size_m=720)
         assert len(tiles) >= 1
-        # All tiles should have XYZ set
         for t in tiles:
             assert t.xyz is not None
-            assert t.xyz.z == 15
 
     def test_xyz_grid_all_different(self):
-        tiles = TileSplitter.xyz_grid((50.07, 14.43, 50.09, 14.46), zoom=15)
+        tiles = TileSplitter.xyz_grid((50.07, 14.43, 50.09, 14.46), tile_size_m=720)
         names = [t.name for t in tiles]
         assert len(names) == len(set(names))
+
+    def test_zoom_for_tile_size_prague(self):
+        # 720 m at Prague (lat≈50°) → zoom 15
+        zoom = TileSplitter.zoom_for_tile_size(720, lat=50.0)
+        assert zoom == 15
+
+    def test_zoom_for_tile_size_small(self):
+        # 90 m at Prague → zoom 18 (or close)
+        zoom = TileSplitter.zoom_for_tile_size(90, lat=50.0)
+        assert 17 <= zoom <= 19
 
     def test_tile_size_at_equator(self):
         sz = TileSplitter.tile_size_meters(zoom=0, lat=0)

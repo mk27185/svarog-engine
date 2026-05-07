@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +112,25 @@ class TaskRunner:
         print(f"  TaskRunner: {len(tiles)} tile(s)  →  {manifest_path}")
         print(f"{'='*60}")
 
+        # Pre-fetch one DEM for the entire area so small tiles don't each
+        # make a separate API call (OpenTopography rejects tiny bboxes).
+        if len(tiles) > 1 and hasattr(self.pipeline, "client") and \
+                hasattr(self.pipeline.client, "prefetch_dem"):
+            union_bbox = (
+                min(t.bbox[0] for t in tiles),  # south
+                min(t.bbox[1] for t in tiles),  # west
+                max(t.bbox[2] for t in tiles),  # north
+                max(t.bbox[3] for t in tiles),  # east
+            )
+            print(f"\n  Pre-fetching DEM for union bbox {union_bbox}...")
+            dem_path = self.pipeline.client.prefetch_dem(
+                union_bbox, output_dir=os.path.join(self.output_root, ".dem_cache")
+            )
+            if dem_path:
+                print(f"  ✓ DEM cached: {dem_path}")
+            else:
+                print("  ✗ DEM pre-fetch failed — tiles will attempt individual downloads")
+
         for i, tile in enumerate(tiles, 1):
             if tile.output_dir:
                 tile_dir = tile.output_dir
@@ -134,8 +153,10 @@ class TaskRunner:
             print(f"\n[{i}/{len(tiles)}] Tile '{tile.name}'  bbox={tile.bbox}")
 
             try:
-                result = self.pipeline.run_pipeline(tile.bbox, tile.name)
-                status  = "completed"
+                # For XYZ tiles, use only the Y index as the file base name
+                # (the directory already encodes z/x/y — no nested path).
+                output_base = str(tile.xyz.y) if tile.xyz else tile.name
+                result = self.pipeline.run_pipeline(tile.bbox, output_base)
                 outputs = {
                     "terrain":     result.get("terrain"),
                     "roads":       result.get("roads"),
@@ -149,7 +170,6 @@ class TaskRunner:
                                 "outputs": outputs}
 
             except Exception as exc:
-                msg = traceback.format_exc()
                 print(f"  ✗ Tile '{tile.name}' selhal: {exc}")
                 manifest.add_tile(tile.name, tile.bbox,
                                   status="failed", error=str(exc))

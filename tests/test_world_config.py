@@ -8,18 +8,17 @@ class TestWorldConfig:
 
     def test_load_from_contracts(self):
         cfg = WorldConfig.load()
-        assert isinstance(cfg.glb_zoom, int)
+        assert isinstance(cfg.tile_size_m, int)
         assert isinstance(cfg.draco, bool)
         assert isinstance(cfg.upsample_factor, int)
         assert isinstance(cfg.load_radius_tiles, int)
 
-    def test_zoom_in_valid_range(self):
+    def test_tile_size_in_valid_range(self):
         cfg = WorldConfig.load()
-        assert 10 <= cfg.glb_zoom <= 22
+        assert 50 <= cfg.tile_size_m <= 5000
 
     def test_contracts_dir_found(self):
         d = _find_contracts_dir()
-        assert d is not None, "svarog-contracts repo should be found as sibling"
         assert (d / "world-config.json").exists()
 
     def test_contracts_has_tiles_property(self):
@@ -28,27 +27,21 @@ class TestWorldConfig:
         assert cfg.upsample_factor >= 1
         assert cfg.load_radius_tiles >= 0
 
-    def test_defaults_without_contracts(self, monkeypatch, tmp_path):
-        """When contracts dir is missing, sensible defaults are used."""
+    def test_missing_contracts_raises(self, monkeypatch, tmp_path):
+        """Missing contracts directory must raise FileNotFoundError, not silently use defaults."""
         monkeypatch.setenv("SVAROG_CONTRACTS_DIR", str(tmp_path / "nonexistent"))
-        # Monkeypatch the sibling-path logic by temporarily pointing it elsewhere
-        import src.pipeline.world_config as wc
-        original = wc._find_contracts_dir
-        monkeypatch.setattr(wc, "_find_contracts_dir", lambda: None)
-
-        cfg = WorldConfig.load()
-        assert cfg.glb_zoom == 15
-        assert cfg.draco is True
+        with pytest.raises(FileNotFoundError, match="nonexistent"):
+            WorldConfig.load()
 
     def test_save_and_reload(self, tmp_path):
-        cfg = WorldConfig(glb_zoom=18, draco=False, upsample_factor=5,
+        cfg = WorldConfig(tile_size_m=200, draco=False, upsample_factor=5,
                          load_radius_tiles=2)
         path = cfg.save(contracts_dir=tmp_path)
         assert path.exists()
 
         with open(path) as f:
             data = json.load(f)
-        assert data["glb_zoom"] == 18
+        assert data["tile_size_m"] == 200
         assert data["draco"] is False
 
 

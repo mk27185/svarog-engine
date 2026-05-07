@@ -125,4 +125,5 @@ def mock_osm_client(simple_highways, simple_buildings):
     client = MagicMock()
     client.get_highways.return_value = simple_highways
     client.get_buildings.return_value = simple_buildings
+    client.get_buildings_with_parts.return_value = simple_buildings
     return client

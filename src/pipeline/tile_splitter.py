@@ -10,7 +10,6 @@ Formulas follow the OSM wiki:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from .task_runner import TileConfig
@@ -24,18 +23,26 @@ class XYZ(NamedTuple):
     y: int
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 class TileSplitter:
 
     @staticmethod
-    def from_xyz(z: int, x: int, y: int) -> TileConfig:
+    def zoom_for_tile_size(tile_size_m: int, lat: float = 0.0) -> int:
         """
-        Convert a single slippy-map tile (z, x, y) to a TileConfig.
+        Return the XYZ zoom level whose tile edge is closest to *tile_size_m*
+        at the given latitude.
 
-        The tile name is "{z}/{x}/{y}" and the bbox is
-        (south, west, north, east) in WGS-84 decimal degrees.
+        This is the only place where tile_size_m is translated to a zoom level.
+        Everything else in the engine works with zoom internally.
         """
+        # tile_size_m(zoom, lat) = EARTH_CIRCUMFERENCE_M / 2^zoom * cos(lat)
+        # → zoom = log2(EARTH_CIRCUMFERENCE_M * cos(lat) / tile_size_m)
+        cos_lat = math.cos(math.radians(lat))
+        zoom_exact = math.log2(EARTH_CIRCUMFERENCE_M * cos_lat / tile_size_m)
+        return round(zoom_exact)
+
+    @staticmethod
+    def from_xyz(z: int, x: int, y: int) -> TileConfig:
+        """Convert a single slippy-map tile (z, x, y) to a TileConfig."""
         north, west = _tile_to_latlon(z, x, y)
         south, east = _tile_to_latlon(z, x + 1, y + 1)
         return TileConfig(
@@ -47,25 +54,23 @@ class TileSplitter:
 
     @staticmethod
     def xyz_grid(
-        bbox:   tuple[float, float, float, float],
-        zoom:   int,
+        bbox:        tuple[float, float, float, float],
+        tile_size_m: int,
     ) -> list[TileConfig]:
         """
-        Return all XYZ tiles that cover *bbox* at the given *zoom* level.
+        Return all XYZ tiles covering *bbox* at the zoom nearest to *tile_size_m*.
 
         Parameters
         ----------
-        bbox : (south, west, north, east) in decimal degrees
-        zoom : slippy-map zoom level
-
-        Returns
-        -------
-        list[TileConfig] ordered row-major (west→east, north→south)
+        bbox        : (south, west, north, east) in decimal degrees
+        tile_size_m : desired tile edge in metres (from world-config.json)
         """
         south, west, north, east = bbox
+        center_lat = (south + north) / 2
+        zoom = TileSplitter.zoom_for_tile_size(tile_size_m, lat=center_lat)
 
-        x_min, y_min = _latlon_to_tile(north, west, zoom)   # NW corner
-        x_max, y_max = _latlon_to_tile(south, east, zoom)   # SE corner
+        x_min, y_min = _latlon_to_tile(north, west, zoom)
+        x_max, y_max = _latlon_to_tile(south, east, zoom)
 
         tiles = []
         for y in range(y_min, y_max + 1):
@@ -75,12 +80,7 @@ class TileSplitter:
 
     @staticmethod
     def tile_size_meters(zoom: int, lat: float = 0.0) -> float:
-        """
-        Width (and height) of one tile in metres at a given latitude.
-
-        At the equator (lat=0) this equals EARTH_CIRCUMFERENCE / 2^zoom.
-        At other latitudes the tile is narrower by cos(lat).
-        """
+        """Actual tile edge in metres for a given zoom and latitude."""
         return EARTH_CIRCUMFERENCE_M / (2 ** zoom) * math.cos(math.radians(lat))
 
     @staticmethod
@@ -92,10 +92,7 @@ class TileSplitter:
 
     @staticmethod
     def tile_center_mercator(z: int, x: int, y: int) -> tuple[float, float]:
-        """
-        Return the tile centre in EPSG:3857 Web Mercator metres (x_m, y_m).
-        This is what the Three.js client uses as the tile position origin.
-        """
+        """Tile centre in EPSG:3857 Web Mercator metres (x_m, y_m)."""
         lat, lon = TileSplitter.tile_center_latlon(z, x, y)
         return _latlon_to_mercator(lat, lon)
 
@@ -103,19 +100,16 @@ class TileSplitter:
 # ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def _latlon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
-    """(lat, lon, zoom) → (x, y) tile index."""
     n = 2 ** zoom
     x = int((lon + 180.0) / 360.0 * n)
     lat_r = math.radians(lat)
     y = int((1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n)
-    # Clamp to valid range
     x = max(0, min(n - 1, x))
     y = max(0, min(n - 1, y))
     return x, y
 
 
 def _tile_to_latlon(z: int, x: int, y: int) -> tuple[float, float]:
-    """Top-left (NW) corner of tile (z, x, y) as (lat, lon)."""
     n = 2 ** z
     lon = x / n * 360.0 - 180.0
     lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
@@ -123,8 +117,7 @@ def _tile_to_latlon(z: int, x: int, y: int) -> tuple[float, float]:
 
 
 def _latlon_to_mercator(lat: float, lon: float) -> tuple[float, float]:
-    """WGS-84 (lat, lon) → EPSG:3857 (x_m, y_m)."""
-    R = 6_378_137.0  # WGS-84 equatorial radius in metres
+    R = 6_378_137.0
     x_m = math.radians(lon) * R
     y_m = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * R
     return x_m, y_m
