@@ -44,6 +44,7 @@ class TileConfig:
     name:       str
     bbox:       tuple[float, float, float, float]
     output_dir: str | None = None   # overrides TaskRunner.output_root
+    xyz:        "tuple | None" = None  # (z, x, y) when generated from slippy tiles
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
@@ -112,7 +113,13 @@ class TaskRunner:
         print(f"{'='*60}")
 
         for i, tile in enumerate(tiles, 1):
-            tile_dir = tile.output_dir or os.path.join(self.output_root, tile.name)
+            if tile.output_dir:
+                tile_dir = tile.output_dir
+            elif tile.xyz is not None:
+                z, x, y = tile.xyz
+                tile_dir = os.path.join(self.output_root, str(z), str(x), str(y))
+            else:
+                tile_dir = os.path.join(self.output_root, tile.name)
             os.makedirs(tile_dir, exist_ok=True)
 
             # Swap the pipeline's output dir so every helper writes into tile_dir

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.conversion.plugin import RoadPlugin, BuildingPlugin
+    from src.conversion.gltf_exporter import GltfExporter
 
 UPSAMPLE_FACTOR = 10   # 30 m SRTM → ≈ 3 m grid  (try 20 for ≈ 1.5 m)
 
@@ -39,6 +40,7 @@ class TerrainPipeline:
         osm_client                                 = None,
         building_extruder: "BuildingPlugin | None" = None,
         sdf_generator                              = None,
+        gltf_exporter:     "GltfExporter | None"   = None,
         upsample_factor:   int                     = UPSAMPLE_FACTOR,
     ):
         self.client            = client
@@ -47,6 +49,7 @@ class TerrainPipeline:
         self.osm_client        = osm_client
         self.building_extruder = building_extruder
         self.sdf_generator     = sdf_generator
+        self.gltf_exporter     = gltf_exporter
         self.upsample_factor   = upsample_factor
 
     def run_pipeline(self, bbox: tuple, output_base_name: str) -> dict:
@@ -60,6 +63,7 @@ class TerrainPipeline:
             "roads": None,
             "buildings": None,
             "sdf_texture": None,
+            "glb": None,
         }
 
         # ── 1. DEM ────────────────────────────────────────────────────────
@@ -148,6 +152,28 @@ class TerrainPipeline:
                     print(f"  ✓ {bld_path}")
                 except Exception as e:
                     print(f"  ✗ {e}")
+
+        # ── 7. GLB export ────────────────────────────────────────────────
+        if self.gltf_exporter:
+            print("\n[7/7] GLB export...")
+            try:
+                cx = meta["total_width_m"]  / 2
+                cy = meta["total_height_m"] / 2
+                exporter_fn = (
+                    self.gltf_exporter.export_draco
+                    if self.gltf_exporter.use_draco
+                    else self.gltf_exporter.export
+                )
+                glb_path = exporter_fn(
+                    result,
+                    output_name=output_base_name,
+                    tile_center_local=(cx, cy),
+                )
+                result["glb"] = glb_path
+                print(f"  ✓ {glb_path}")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"  ✗ GLB selhal: {e}")
 
         print(f"\n{'='*60}")
         print("  PIPELINE HOTOV")

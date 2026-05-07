@@ -3,6 +3,7 @@ from .road_mesh import RoadMesh
 from .building_extruder import BuildingExtruder
 from .terrain_stamper import TerrainStamper
 from .sdf_generator import SDFGenerator
+from .gltf_exporter import GltfExporter
 
 __all__ = [
     "RoadPlugin",
@@ -11,4 +12,5 @@ __all__ = [
     "BuildingExtruder",
     "TerrainStamper",
     "SDFGenerator",
+    "GltfExporter",
 ]
