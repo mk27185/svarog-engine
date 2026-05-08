@@ -8,6 +8,10 @@ pillow
 trimesh
 triangle
 shapely
+jsonschema>=4.18
+PyYAML
+DracoPy
+pygltflib
 
 # GPU acceleration (RTX 3090, CUDA driver 13.2 je zpětně kompatibilní s cupy-cuda12x)
 # Pokud instalace selže, zkus: pip install cupy-cuda13x

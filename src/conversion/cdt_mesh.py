@@ -29,13 +29,12 @@ Dependencies: triangle (Shewchuk CDT), shapely ≥ 2.0
 import os
 import math
 import numpy as np
-from scipy.ndimage import uniform_filter1d
 
 import triangle as tr
 from shapely import STRtree, points as shp_points
 from shapely.geometry import Polygon, LineString
 
-from .geo_utils import to_local, sample_z
+from .geo_utils import to_local, sample_z, subdivide_polyline, smooth_profile
 from .terrain_stamper import ROAD_HALF_WIDTHS, DEFAULT_HALF_WIDTH
 
 SUBDIVISION_STEP = 2.0    # metres between road-boundary vertices
@@ -150,7 +149,7 @@ class CDTMeshBuilder:
             half_w = self._half_width(tags)
 
             local  = [to_local(lon, lat, meta) for lon, lat in nodes]
-            segs   = self._subdivide(local, step)
+            segs   = subdivide_polyline(local, step)
             if len(segs) < 2:
                 continue
 
@@ -164,7 +163,7 @@ class CDTMeshBuilder:
             raw_z = np.array([
                 sample_z(x, y, z_grid, meta) for x, y in segs
             ], dtype=np.float64)
-            smooth_z = self._smooth(raw_z) + Z_ROAD_OFFSET
+            smooth_z = smooth_profile(raw_z, SMOOTH_WINDOW) + Z_ROAD_OFFSET
 
             # clip to terrain bbox with a small margin
             margin = half_w + 1.0
@@ -270,22 +269,6 @@ class CDTMeshBuilder:
     # Geometry helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    def _subdivide(self, local_nodes: list[tuple], step: float) -> list[tuple]:
-        pts: list[tuple] = []
-        for i in range(len(local_nodes) - 1):
-            x0, y0 = local_nodes[i]
-            x1, y1 = local_nodes[i + 1]
-            L = math.hypot(x1 - x0, y1 - y0)
-            if L < 1e-6:
-                continue
-            n = max(1, math.ceil(L / step))
-            for j in range(n):
-                t = j / n
-                pts.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
-        if local_nodes:
-            pts.append(local_nodes[-1])
-        return pts
-
     @staticmethod
     def _miter_normals(pts: np.ndarray, half_w: float) -> np.ndarray:
         """Per-vertex perpendicular offset vectors (magnitude = half_w with miter scale)."""
@@ -319,13 +302,6 @@ class CDTMeshBuilder:
             normals[i] = norm * half_w * scale
 
         return normals
-
-    @staticmethod
-    def _smooth(zs: np.ndarray, window: int = SMOOTH_WINDOW) -> np.ndarray:
-        if len(zs) < 3:
-            return zs
-        w = min(window, len(zs))
-        return uniform_filter1d(zs, size=w, mode="nearest")
 
     @staticmethod
     def _half_width(tags: dict) -> float:

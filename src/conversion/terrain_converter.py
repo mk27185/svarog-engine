@@ -70,43 +70,91 @@ class TerrainConverter:
         output_dir: str | None = None,
     ) -> str:
         """Write plain terrain OBJ (regular quad grid, no road modification)."""
-        output_dir  = output_dir or self.output_dir
+        return self._write_obj_impl(
+            z_grid, meta, obj_name, output_dir, with_uv=False
+        )
+
+    def write_obj_with_uv(
+        self,
+        z_grid:     np.ndarray,
+        meta:       dict,
+        obj_name:   str | None = None,
+        output_dir: str | None = None,
+    ) -> str:
+        """Write terrain OBJ with UV texture coordinates (for SDF overlay)."""
+        return self._write_obj_impl(
+            z_grid, meta, obj_name, output_dir, with_uv=True
+        )
+
+    def _write_obj_impl(
+        self,
+        z_grid:     np.ndarray,
+        meta:       dict,
+        obj_name:   str | None = None,
+        output_dir: str | None = None,
+        with_uv:    bool = False,
+    ) -> str:
+        """Shared OBJ writer (optionally emits VT lines + indexed faces)."""
+        output_dir = output_dir or self.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
         h, w       = meta["h"], meta["w"]
         transform  = meta["transform"]
-        lon_origin = meta["lon_origin"]
-        lat_origin = meta["lat_origin"]
+        bounds     = meta.get("bounds")
+        lon_origin = meta.get("lon_origin", bounds.left if bounds else 0.0)
+        lat_origin = meta.get("lat_origin", bounds.bottom if bounds else 0.0)
         mpd_lon    = meta["meters_per_deg_lon"]
         mpd_lat    = meta["meters_per_deg_lat"]
+        total_w    = meta["total_width_m"]
+        total_h    = meta["total_height_m"]
 
         fname       = f"{obj_name}.obj" if obj_name else "terrain.obj"
         output_file = os.path.join(output_dir, fname)
 
         with open(output_file, "w") as f:
-            f.write("# Terrain OBJ – local metric coords (origin = SW corner)\n")
+            f.write(
+                "# Terrain OBJ - local metric coords (origin = SW corner)\n"
+            )
             f.write(
                 f"# Origin: lon={lon_origin:.6f}, lat={lat_origin:.6f}  "
-                f"grid={h}×{w}  cell={meta['cell_width_m']:.2f}×"
+                f"grid={h}x{w}  cell={meta['cell_width_m']:.2f}x"
                 f"{meta['cell_height_m']:.2f} m\n"
             )
+
             for r in range(h + 1):
                 for c in range(w + 1):
                     lon, lat = transform * (c, r)
                     x = (lon - lon_origin) * mpd_lon
                     y = (lat - lat_origin) * mpd_lat
-                    f.write(f"v {x:.3f} {y:.3f} {float(z_grid[r,c]):.3f}\n")
+                    elev = float(z_grid[r, c])
+                    f.write(f"v {x:.3f} {y:.3f} {elev:.3f}\n")
+
+                    if with_uv:
+                        uv_x = c / w if w > 0 else 0.0
+                        uv_y = 1.0 - (r / h if h > 0 else 0.0)
+                        f.write(f"vt {uv_x:.4f} {uv_y:.4f}\n")
 
             for r in range(h):
                 for c in range(w):
-                    v1 = r * (w + 1) + c + 1
+                    vi = r * (w + 1) + c
+                    v1 = vi + 1
                     v2 = v1 + 1
                     v3 = v1 + (w + 1)
                     v4 = v3 + 1
-                    f.write(f"f {v1} {v2} {v3}\nf {v2} {v4} {v3}\n")
+
+                    if with_uv:
+                        f.write(f"f {v1}/{v1} {v2}/{v2} {v3}/{v3}\n")
+                        f.write(f"f {v2}/{v2} {v4}/{v4} {v3}/{v3}\n")
+                    else:
+                        f.write(f"f {v1} {v2} {v3}\n")
+                        f.write(f"f {v2} {v4} {v3}\n")
 
         total = h * w * 2
-        print(f"   Terrain OBJ: {output_file}  ({(h+1)*(w+1):,} vrcholů, {total:,} faces)")
+        uv_tag = " (uv)" if with_uv else ""
+        print(
+            f"   Terrain OBJ{uv_tag}: {output_file}  "
+            f"({(h + 1) * (w + 1):,} vertices, {total:,} faces)"
+        )
         return output_file
 
     def convert_tif_to_obj(
