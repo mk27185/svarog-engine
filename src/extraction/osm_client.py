@@ -227,6 +227,79 @@ class OsmClient:
         return results
 
     @staticmethod
+    def _assemble_ring(outer_refs: list[int], way_nodes: dict[int, list]) -> list[dict] | None:
+        """
+        Chain a list of outer way references into one closed polygon ring.
+
+        OSM multipolygon outer rings are often split across several way
+        members that share endpoints (one way's last node = next way's first
+        node).  This method stitches them into a single node list.
+
+        Returns the assembled node list (without closing duplicate), or
+        ``None`` if the ways cannot be chained into a valid ring (≥ 3 nodes).
+        """
+        # Collect node lists for each way; strip GeoJSON-style closing node.
+        segments: list[list[dict]] = []
+        for ref in outer_refs:
+            nodes = list(way_nodes.get(ref, []))
+            if not nodes:
+                continue
+            if len(nodes) > 1 and nodes[0] == nodes[-1]:
+                nodes = nodes[:-1]
+            if len(nodes) >= 2:
+                segments.append(nodes)
+
+        if not segments:
+            return None
+        if len(segments) == 1:
+            return segments[0] if len(segments[0]) >= 3 else None
+
+        def _same(a: dict, b: dict) -> bool:
+            return abs(a["lon"] - b["lon"]) < 1e-7 and abs(a["lat"] - b["lat"]) < 1e-7
+
+        # Greedy forward-chain from segment[0]; try both ends of candidates.
+        chain: list[dict] = list(segments[0])
+        used: set[int] = {0}
+
+        while len(used) < len(segments):
+            matched = False
+            tail = chain[-1]
+            head = chain[0]
+
+            for i, seg in enumerate(segments):
+                if i in used:
+                    continue
+                if _same(tail, seg[0]):
+                    chain.extend(seg[1:])
+                    used.add(i)
+                    matched = True
+                    break
+                if _same(tail, seg[-1]):
+                    chain.extend(reversed(seg[:-1]))
+                    used.add(i)
+                    matched = True
+                    break
+                if _same(head, seg[-1]):
+                    chain = list(seg[:-1]) + chain
+                    used.add(i)
+                    matched = True
+                    break
+                if _same(head, seg[0]):
+                    chain = list(reversed(seg[1:])) + chain
+                    used.add(i)
+                    matched = True
+                    break
+
+            if not matched:
+                break  # remaining segments cannot be connected — give up
+
+        # Only return the assembled ring if ALL segments were consumed.
+        # If some could not be chained, the caller falls back to per-way handling.
+        if len(used) < len(segments):
+            return None
+        return chain if len(chain) >= 3 else None
+
+    @staticmethod
     def _relations_by_tag(
         elements: list[dict],
         way_nodes: dict[int, list],
@@ -235,14 +308,12 @@ class OsmClient:
         """
         Extract building outlines from relations that carry ``tag``.
 
-        Each outer-ring member way of a matching relation is returned as a
-        separate building dict carrying the **relation's** tags.  This is the
-        key step that lets us render multipolygon buildings whose outer outline
-        is only tagged on the relation, not on the individual way.
+        Outer rings composed of multiple way members are stitched into one
+        closed polygon via ``_assemble_ring``.  This handles the common OSM
+        pattern where a building's outer boundary is split across several ways.
 
-        Relations with multiple outer rings (building complexes) produce one
-        dict per outer ring, each with a unique negative pseudo-ID so
-        deduplication logic elsewhere does not collapse them.
+        Relations with multiple *disconnected* outer rings (building complexes)
+        produce one dict per ring, each with a unique negative pseudo-ID.
         """
         results = []
         for el in elements:
@@ -257,20 +328,34 @@ class OsmClient:
                 if m.get("type") == "way" and m.get("role") in ("outer", "")
             ]
 
-            for idx, ref in enumerate(outer_refs):
-                nodes = list(way_nodes.get(ref, []))
-                if len(nodes) > 1 and nodes[0] == nodes[-1]:
-                    nodes = nodes[:-1]
-                if len(nodes) < 3:
-                    continue
-                # Negative pseudo-ID: unique per outer ring, never conflicts
-                # with positive OSM way/relation IDs.
-                pseudo_id = -(el["id"] * 1000 + idx)
+            if not outer_refs:
+                continue
+
+            # Try to assemble all outer ways into one ring first.
+            ring = OsmClient._assemble_ring(outer_refs, way_nodes)
+            if ring and len(ring) >= 3:
+                pseudo_id = -(el["id"] * 1000)
                 results.append({
-                    "id":       pseudo_id,
-                    "nodes":    nodes,
-                    "tags":     rtags,
+                    "id":    pseudo_id,
+                    "nodes": ring,
+                    "tags":  rtags,
                 })
+            else:
+                # Fall back: treat each outer way as a separate polygon.
+                # This handles building complexes with multiple disconnected
+                # outer rings (e.g. a courtyard block).
+                for idx, ref in enumerate(outer_refs):
+                    nodes = list(way_nodes.get(ref, []))
+                    if len(nodes) > 1 and nodes[0] == nodes[-1]:
+                        nodes = nodes[:-1]
+                    if len(nodes) < 3:
+                        continue
+                    pseudo_id = -(el["id"] * 1000 + idx)
+                    results.append({
+                        "id":    pseudo_id,
+                        "nodes": nodes,
+                        "tags":  rtags,
+                    })
 
         print(f"   Nalezeno {len(results)} prvků (tag: {tag}, relations).")
         return results
@@ -281,23 +366,26 @@ class OsmClient:
         parts: list[dict],
     ) -> list[dict]:
         """
-        Remove outer building outlines whose footprint already overlaps with
-        building:part polygons (OSM S3DB outer-shell suppression).
+        Remove outer building outlines whose footprint is already fully covered
+        by building:part polygons (OSM S3DB outer-shell suppression).
 
-        When an OSM building is modelled with Simple 3D Buildings parts,
-        the outer ``building=yes`` way is a "shadow" footprint that should
-        **not** be extruded alongside the detailed parts.
+        When an OSM building is modelled with Simple 3D Buildings parts that
+        collectively cover its entire footprint, the outer ``building=yes``
+        outline is a "shadow" that should not be extruded on top of the parts.
 
-        Detection: a building outline is suppressed when any building:part
-        polygon overlaps it with at least 15 % area intersection relative to
-        the part's own area.  This is more robust than centroid containment,
-        which fails for parts near polygon edges or with unusual shapes.
+        Detection: a building outline is suppressed only when the *union* of
+        all overlapping building:part polygons covers at least 85 % of the
+        outline's own area.  This prevents incorrectly suppressing partially-
+        modelled landmarks (e.g. a cathedral where only domes and towers are
+        drawn as parts but the main body is not), while still suppressing fully
+        decomposed S3DB buildings where every square metre is a named part.
         """
         if not parts:
             return buildings
 
         try:
             from shapely.geometry import Polygon
+            from shapely.ops import unary_union
             from shapely.strtree import STRtree
         except ImportError:
             return buildings
@@ -333,21 +421,24 @@ class OsmClient:
                 bpoly = Polygon(coords)
                 if not bpoly.is_valid:
                     bpoly = bpoly.buffer(0)
-                if bpoly.is_empty:
+                if bpoly.is_empty or bpoly.area == 0:
                     kept.append(b)
                     continue
 
-                # Query only candidate parts whose bounding box overlaps
-                candidates = part_tree.query(bpoly)
-                should_suppress = False
-                for idx in candidates:
-                    pp = part_polys[idx]
-                    inter_area = bpoly.intersection(pp).area
-                    if inter_area > 0.15 * pp.area:
-                        should_suppress = True
-                        break
+                # Collect all parts whose bounding box overlaps this shell.
+                candidate_idxs = part_tree.query(bpoly)
+                if not len(candidate_idxs):
+                    kept.append(b)
+                    continue
 
-                if should_suppress:
+                # Suppress only when the parts UNION covers ≥85 % of the shell.
+                # Small landmarks (e.g. a cathedral where only the domes are
+                # tagged as parts) must not lose their main body shell.
+                candidate_geoms = [part_polys[idx] for idx in candidate_idxs]
+                parts_union = unary_union(candidate_geoms)
+                coverage = bpoly.intersection(parts_union).area / bpoly.area
+
+                if coverage >= 0.85:
                     suppressed += 1
                 else:
                     kept.append(b)

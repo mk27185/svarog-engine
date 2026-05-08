@@ -297,15 +297,42 @@ class TestOsmClientBuildingParsing(unittest.TestCase):
             "tags": {"building:part": "yes"},
         }
 
+    @staticmethod
+    def _covering_part(part_id: int, lon0: float, lat0: float, size: float) -> dict:
+        """Part that exactly matches a _building_dict polygon (100 % coverage)."""
+        return {
+            "id": part_id,
+            "nodes": [
+                {"lon": lon0,          "lat": lat0},
+                {"lon": lon0 + size,   "lat": lat0},
+                {"lon": lon0 + size,   "lat": lat0 + size},
+                {"lon": lon0,          "lat": lat0 + size},
+            ],
+            "tags": {"building:part": "yes"},
+        }
+
     def test_suppress_removes_covered_shell(self):
+        """Shell fully covered (100 %) by one part → suppressed."""
         building = self._building_dict(1, 14.43, 50.07, size=0.002)
-        part     = self._part_dict(2,     14.43, 50.07, size=0.001)
+        part = self._covering_part(2, 14.43, 50.07, size=0.002)
         result = OsmClient._suppress_outer_shells([building], [part])
         assert result == []   # outer shell suppressed
 
+    def test_suppress_partial_model_kept(self):
+        """Shell with only a small decorative part (≤25 % coverage) is kept.
+
+        Real-world case: landmark where only a dome/tower is a building:part
+        but the main body is not.  The outer shell must stay visible.
+        """
+        building = self._building_dict(1, 14.43, 50.07, size=0.002)
+        # Small dome part — offset inside building, covers only ~25 % of area.
+        part = self._part_dict(2, 14.43, 50.07, size=0.001)
+        result = OsmClient._suppress_outer_shells([building], [part])
+        assert len(result) == 1   # outer shell kept
+
     def test_suppress_keeps_uncovered_building(self):
         building = self._building_dict(1, 14.43, 50.07, size=0.002)
-        # Part is far away – centroid not inside the building
+        # Part is far away – no overlap with the building
         part = self._part_dict(2, 14.50, 50.10, size=0.001)
         result = OsmClient._suppress_outer_shells([building], [part])
         assert len(result) == 1   # building kept
@@ -316,10 +343,11 @@ class TestOsmClientBuildingParsing(unittest.TestCase):
         assert len(result) == 3
 
     def test_suppress_mixed(self):
-        """Building A has a part inside → suppressed; B does not → kept."""
+        """Building A fully covered by its part → suppressed; B without part → kept."""
         bld_a = self._building_dict(1, 14.43, 50.07, size=0.002)
         bld_b = self._building_dict(2, 14.50, 50.07, size=0.002)
-        part  = self._part_dict(3, 14.43, 50.07, size=0.001)  # inside A
+        # Part exactly covers A (100 % coverage).
+        part = self._covering_part(3, 14.43, 50.07, size=0.002)
         result = OsmClient._suppress_outer_shells([bld_a, bld_b], [part])
         ids = [b["id"] for b in result]
         assert 1 not in ids   # A suppressed

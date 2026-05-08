@@ -237,7 +237,9 @@ class BuildingExtruder:
         # complex polygons.  We therefore use the ridged algorithm only when:
         #   a) roof:direction is explicitly tagged, OR
         #   b) the cleaned polygon is simple (≤ 5 unique vertices, i.e. ~rectangular)
-        # Otherwise we fall back to a pyramid, which always looks clean.
+        # Otherwise we fall back to FLAT (not pyramid): a complex building tagged
+        # as gabled/hipped must not silently produce a pyramid-shaped roof just
+        # because its footprint is irregular.
         def _ridge(end_inset: float):
             clean_n = len(BuildingExtruder._clean_polygon(top_xy))
             has_dir = tags.get("roof:direction") is not None
@@ -247,20 +249,24 @@ class BuildingExtruder:
                         top_xy, n, plate_z, roof_height, tags, end_inset)
                 except Exception:
                     pass
-            return BuildingExtruder._roof_pyramid(top_xy, n, plate_z, roof_height)
+            return [plate_z] * n, [], BuildingExtruder._triangulate_polygon(top_xy)
 
+        _pyram = lambda: BuildingExtruder._roof_pyramid(top_xy, n, plate_z, roof_height)
         dispatch = {
-            "pyramid":     lambda: BuildingExtruder._roof_pyramid(top_xy, n, plate_z, roof_height),
-            "cone":        lambda: BuildingExtruder._roof_pyramid(top_xy, n, plate_z, roof_height),
+            "pyramid":           _pyram,
+            "pyramidal":         _pyram,   # OSM alias
+            "cone":              _pyram,
             "skillion":    lambda: BuildingExtruder._roof_skillion(top_xy, n, plate_z, roof_height, tags),
             "dome":        lambda: BuildingExtruder._roof_dome(top_xy, n, plate_z, roof_height, "dome"),
             "onion":       lambda: BuildingExtruder._roof_dome(top_xy, n, plate_z, roof_height, "onion"),
-            "gabled":      lambda: _ridge(0.00),
-            "hipped":      lambda: _ridge(0.30),
-            "half-hipped": lambda: _ridge(0.15),
-            "gambrel":     lambda: _ridge(0.00),
-            "mansard":     lambda: _ridge(0.00),
-            "round":       lambda: _ridge(0.00),
+            "gabled":            lambda: _ridge(0.00),
+            "hipped":            lambda: _ridge(0.30),
+            "half-hipped":       lambda: _ridge(0.15),
+            "gambrel":           lambda: _ridge(0.00),
+            "mansard":           lambda: _ridge(0.00),
+            "round":             lambda: _ridge(0.00),
+            "saltbox":           lambda: _ridge(0.00),
+            "pitched":           lambda: _ridge(0.00),
         }
         handler = dispatch.get(shape)
         if handler:
