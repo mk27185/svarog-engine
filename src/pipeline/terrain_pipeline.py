@@ -4,18 +4,21 @@ Full terrain pipeline
   1. DEM download (OpenTopography)
   2. Terrain grid  – bilinear upsample, smooth SRTM grid
   3. Terrain OBJ   – regular quad mesh with UV coords
-  4. OSM highways  – download or load from cache
-  5. SDF road texture – RGBA PNG (R=distance, G=rank, B=width, A=mask)
+  4. OSM highways + landcover – download or load from cache
+  5. SDF road texture + landcover PNG
   6. Buildings OBJ – extruded footprints (OSM S3DB building:part support)
-  7. GLB export    – combined terrain + buildings
+  7. Navmesh (optional) – walkable triangle soup for EXT_svarog_navmesh
+  8. GLB export    – terrain + buildings + embedded textures + navmesh
 
 Outputs (all in output_dir):
   <base>_terrain.obj       ← terrain mesh with UV coords
-  <base>_roads_sdf.png     ← SDF road texture (apply in Three.js as terrain material)
+  <base>_roads_sdf.png     ← SDF road texture (also embedded in GLB when present)
+  <base>_landcover.png     ← landcover overlay (water/green/rail; embedded in GLB)
   <base>_buildings.obj     ← extruded OSM buildings
   <base>.glb               ← combined GLB (terrain + buildings), Y-up
   <base>_osm_highways.json ← cached OSM highway data (re-used on subsequent runs)
   <base>_osm_buildings.json← cached OSM building data (re-used on subsequent runs)
+  <base>_osm_landcover.json← cached landcover OSM data
 
 OSM cache
 ---------
@@ -51,9 +54,12 @@ class TerrainPipeline:
         osm_client                                 = None,
         building_extruder: "BuildingPlugin | None" = None,
         sdf_generator                              = None,
+        landcover_generator                        = None,
+        navmesh_builder                            = None,
         gltf_exporter:     "GltfExporter | None"   = None,
         upsample_factor:   int                     = UPSAMPLE_FACTOR,
         osm_force_download: bool                   = False,
+        build_navmesh:     bool                    = True,
         # kept for backward compat with tests that still pass road_mesh
         road_mesh                                  = None,
     ):
@@ -62,9 +68,12 @@ class TerrainPipeline:
         self.osm_client         = osm_client
         self.building_extruder  = building_extruder
         self.sdf_generator      = sdf_generator
+        self.landcover_generator = landcover_generator
+        self.navmesh_builder    = navmesh_builder
         self.gltf_exporter      = gltf_exporter
         self.upsample_factor    = upsample_factor
         self.osm_force_download = osm_force_download
+        self.build_navmesh      = build_navmesh
 
     def run_pipeline(self, bbox: tuple, output_base_name: str) -> dict:
         print(f"\n{'='*60}")
@@ -73,26 +82,41 @@ class TerrainPipeline:
         print(f"{'='*60}")
 
         result = {
-            "terrain":     None,
-            "sdf_texture": None,
-            "buildings":   None,
-            "glb":         None,
+            "terrain":           None,
+            "sdf_texture":       None,
+            "landcover_texture": None,
+            "buildings":         None,
+            "navmesh":           None,
+            "glb":               None,
         }
 
         # ── 1. DEM ────────────────────────────────────────────────────────
         print("\n[1/5] Stahuji DEM...")
-        tif_path = self.client.get_dem(bbox)
+        tif_path = self.client.get_dem(bbox, buffer_px=1)
         if not tif_path or not os.path.exists(tif_path):
             print("  ✗ Nepodařilo se stáhnout DEM.")
             return result
         print(f"  ✓ {tif_path}")
 
         # ── 2. Terrain grid ───────────────────────────────────────────────
-        print(f"\n[2/5] Terrain grid (upsample {self.upsample_factor}×, bilinear)...")
+        print(f"\n[2/5] Terrain grid (upsample {self.upsample_factor}×)...")
         try:
-            z_grid, meta = self.converter.build_grid(
-                tif_path, upsample_factor=self.upsample_factor
-            )
+            # Prefer the seamless sampler: vertices derived from exact slippy-
+            # tile boundaries + bilinear sampling from the union DEM cache.
+            # This guarantees adjacent tiles agree on boundary elevation.
+            union_dem = getattr(self.client, "_cache_path", None)
+            if union_dem and os.path.exists(union_dem):
+                z_grid, meta = self.converter.build_grid_seamless(
+                    bbox_orig=bbox,
+                    union_dem_path=union_dem,
+                    upsample_factor=self.upsample_factor,
+                )
+            else:
+                z_grid, meta = self.converter.build_grid(
+                    tif_path,
+                    upsample_factor=self.upsample_factor,
+                    bbox_orig=bbox,
+                )
         except Exception as e:
             print(f"  ✗ {e}")
             return result
@@ -113,11 +137,14 @@ class TerrainPipeline:
             print(f"  ✗ {e}")
             return result
 
-        # ── 4. OSM data + SDF texture + Buildings ─────────────────────────
+        # ── 4. OSM data + SDF / landcover textures + Buildings ────────────
         highways: list = []
+        buildings: list = []
+        landcover_features: dict | None = None
+
         if self.osm_client:
             osm_dir = self.converter.output_dir
-            print("\n[4/5] OSM data...")
+            print("\n[4/7] OSM data...")
             highways = self._load_or_fetch(
                 bbox,
                 cache_path=os.path.join(osm_dir, f"{output_base_name}_osm_highways.json"),
@@ -125,6 +152,16 @@ class TerrainPipeline:
                 label="silnic",
             )
             print(f"  ✓ {len(highways)} silnic")
+
+            if self.landcover_generator and hasattr(self.osm_client, "get_landcover"):
+                landcover_features = self._load_or_fetch(
+                    bbox,
+                    cache_path=os.path.join(
+                        osm_dir, f"{output_base_name}_osm_landcover.json",
+                    ),
+                    fetch_fn=self.osm_client.get_landcover,
+                    label="landcover",
+                )
 
         if self.sdf_generator and highways:
             print("  SDF textura silnic...")
@@ -138,6 +175,19 @@ class TerrainPipeline:
             except Exception as e:
                 traceback.print_exc()
                 print(f"  ✗ SDF selhal: {e}")
+
+        if self.landcover_generator and landcover_features:
+            print("  Landcover textura...")
+            try:
+                lc_path = os.path.join(
+                    self.converter.output_dir, f"{output_base_name}_landcover.png",
+                )
+                self.landcover_generator.generate(landcover_features, meta, lc_path)
+                result["landcover_texture"] = lc_path
+                print(f"  ✓ {lc_path}")
+            except Exception as e:
+                traceback.print_exc()
+                print(f"  ✗ Landcover selhal: {e}")
 
         if self.osm_client and self.building_extruder:
             osm_dir = self.converter.output_dir
@@ -162,12 +212,34 @@ class TerrainPipeline:
                 except Exception as e:
                     print(f"  ✗ {e}")
 
-        # ── 5. GLB export ─────────────────────────────────────────────────
-        if self.gltf_exporter:
-            print("\n[5/5] GLB export...")
+        if self.build_navmesh and self.navmesh_builder:
+            print("\n[5/7] Navmesh...")
             try:
+                nm = self.navmesh_builder.build(buildings or [], meta)
+                if nm:
+                    result["navmesh"] = nm
+                    print(
+                        f"  ✓ {len(nm['vertices'])} verts, "
+                        f"{len(nm['indices'])} tris, "
+                        f"area {nm.get('walkable_area_m2', 0):.0f} m²"
+                    )
+                else:
+                    print("  ⚠ Navmesh prázdný")
+            except Exception as e:
+                traceback.print_exc()
+                print(f"  ✗ Navmesh selhal: {e}")
+
+        # ── 6. GLB export ─────────────────────────────────────────────────
+        if self.gltf_exporter:
+            print("\n[6/7] GLB export...")
+            try:
+                import numpy as np  # noqa: PLC0415
                 cx = meta["total_width_m"]  / 2
                 cy = meta["total_height_m"] / 2
+                elev_min = float(np.nanmin(z_grid))
+                elev_max = float(np.nanmax(z_grid))
+                has_sdf  = result.get("sdf_texture") is not None
+
                 exporter_fn = (
                     self.gltf_exporter.export_draco
                     if self.gltf_exporter.use_draco
@@ -177,9 +249,15 @@ class TerrainPipeline:
                     result,
                     output_name=output_base_name,
                     tile_center_local=(cx, cy),
+                    elev_min=elev_min,
+                    elev_max=elev_max,
+                    has_sdf=has_sdf,
                 )
-                result["glb"] = glb_path
-                print(f"  ✓ {glb_path}")
+                result["glb"]      = glb_path
+                result["elev_min"] = elev_min
+                result["elev_max"] = elev_max
+                print(f"  ✓ {glb_path}  "
+                      f"(elev {elev_min:.0f}–{elev_max:.0f} m, sdf={has_sdf})")
             except Exception as e:
                 traceback.print_exc()
                 print(f"  ✗ GLB selhal: {e}")
@@ -213,7 +291,8 @@ class TerrainPipeline:
             try:
                 with open(cache_path, encoding="utf-8") as fh:
                     data = json.load(fh)
-                print(f"  ↩ {label} načteno z cache: {cache_path} ({len(data)} prvků)")
+                n = len(data) if hasattr(data, "__len__") else "?"
+                print(f"  ↩ {label} načteno z cache: {cache_path} ({n} prvků)")
                 return data
             except Exception as exc:
                 print(f"  ⚠ Cache {cache_path} nelze načíst ({exc}), stahuji znovu...")

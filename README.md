@@ -22,16 +22,16 @@ All commands are run from the repo root with the venv active.
 
 ```bash
 # Bbox in decimal degrees (S,W,N,E) — splits into XYZ tiles at zoom from world-config
-python -m svarog_engine --bbox "50.07,14.43,50.09,14.46" --output outputs/test/
+python -m src --bbox "50.07,14.43,50.09,14.46" --output outputs/test/
 
-# Override zoom and force Draco compression
-python -m svarog_engine --bbox "50.07,14.43,50.09,14.46" --zoom 18 --draco --output outputs/hd/
+# Force Draco compression (zoom / tile geometry still follows world-config tile_size_m)
+python -m src --bbox "50.07,14.43,50.09,14.46" --draco --output outputs/hd/
 ```
 
 ### Single XYZ tile
 
 ```bash
-python -m svarog_engine --tile 15/17698/11100 --output outputs/test/
+python -m src --tile 15/17698/11100 --output outputs/test/
 ```
 
 ### Batch YAML config
@@ -48,7 +48,7 @@ tiles:
 ```
 
 ```bash
-python -m svarog_engine --config tiles.yaml
+python -m src --config tiles.yaml
 ```
 
 ### Global config
@@ -81,10 +81,10 @@ After the first successful Overpass API download, highway and building data are 
 
 ```bash
 # Normal run — uses cache if present, downloads otherwise
-python -m svarog_engine --tile 15/17698/11100 --output outputs/test/
+python -m src --tile 15/17698/11100 --output outputs/test/
 
 # Force re-download of OSM data (e.g. after the map has been updated)
-python -m svarog_engine --tile 15/17698/11100 --force-osm --output outputs/test/
+python -m src --tile 15/17698/11100 --force-osm --output outputs/test/
 ```
 
 To clear the cache for a tile manually, delete the two `_osm_*.json` files in its output directory.
@@ -136,7 +136,7 @@ python -m pytest tests/ -s                            # show print output
 
 ```
 src/
-  __main__.py               # CLI entry point (python -m svarog_engine)
+  __main__.py               # CLI entry point (python -m src from repo root)
   conversion/
     terrain_converter.py    # GeoTIFF → terrain grid + OBJ
     terrain_stamper.py      # Blend road geometry into elevation

@@ -28,6 +28,17 @@ LEVEL_HEIGHT  = 3.0
 CYLINDER_SEGS = 32   # polygon segments for building:shape=cylinder
 DOME_RINGS    = 5    # latitude rings for dome/onion roof
 
+# Tiny offset applied to the TOP of the underground foundation so the wall
+# just breaks through the terrain surface (prevents z-fighting at grade).
+_BUILDING_Z_BIAS: float = 0.05
+
+# Building walls are extended this far BELOW the terrain at each corner.
+# Because the terrain mesh is opaque and rendered with depth testing, it
+# occludes the underground portion, so the wall appears to rise naturally
+# from the terrain surface even on slopes where the surrounding ground is
+# lower than the footprint edge.  5 m handles most Prague terrain relief.
+_FOUNDATION_DEPTH: float = 5.0
+
 
 class BuildingExtruder:
 
@@ -105,6 +116,18 @@ class BuildingExtruder:
             min_h  = self._parse_min_height(tags)
             roof_h = self._roof_height(tags, self._total_height(tags))
 
+            # Sanity-clamp min_height so that building:parts with OSM data
+            # inconsistencies (e.g. dome min_height > main building height)
+            # don't produce geometry that floats far above the roof.
+            # We allow up to 200 m — enough for any real building in the dataset
+            # while rejecting clearly erroneous values.
+            _total = self._total_height(tags)
+            if min_h > 0 and _total > 0 and min_h >= _total:
+                # min_height references a level above the building's own top —
+                # treat as zero (place at terrain level) to avoid floating parts.
+                min_h  = 0.0
+                wall_h = max(0.0, _total - roof_h)
+
             # 3. Local metric coords + terrain elevation
             local_xy = [to_local(nd["lon"], nd["lat"], meta) for nd in nodes]
             corner_zs = [sample_z(x, y, z_grid, meta) for x, y in local_xy]
@@ -121,31 +144,30 @@ class BuildingExtruder:
                 local_xy  = local_xy[::-1]
                 corner_zs = corner_zs[::-1]
 
-            # Anchor the building height to the terrain at the footprint
-            # centroid.  Using the centroid (rather than the max corner) keeps
-            # neighbouring building:parts of the same complex at consistent
-            # plate heights even when the terrain varies slightly across parts.
-            # A safety clamp ensures the top ring never dips below any base
-            # corner (prevents inverted walls on steep slopes).
-            cx = sum(x for x, y in local_xy) / len(local_xy)
-            cy = sum(y for x, y in local_xy) / len(local_xy)
-            anchor_z = sample_z(cx, cy, z_grid, meta)
-            # On steep slopes the centroid may be lower than some corners.
-            # Clamp so walls are at least 10 % of their height on the high side.
-            # Only applies when there are actual walls (wall_h > 0); for roof-only
-            # sections (wall_h = 0, e.g. canopies) the centroid anchor is used as-is.
+            # Anchor: terrain elevation at footprint centroid.
+            # The centroid gives a consistent plate height across building:parts
+            # of the same complex.  On steep slopes the centroid may be lower
+            # than the highest corner, so clamp upward so that all walls have at
+            # least 10 % of their nominal height (prevents inverted wall strips).
+            bld_cx = sum(x for x, y in local_xy) / len(local_xy)
+            bld_cy = sum(y for x, y in local_xy) / len(local_xy)
+            anchor_z = sample_z(bld_cx, bld_cy, z_grid, meta)
             if wall_h > 0:
                 anchor_z = max(anchor_z, max(corner_zs) - wall_h * 0.9)
 
             # 4. Base ring
             if min_h > 0.0:
-                # Elevated part: flat base at anchor + min_height
-                base_zs = [anchor_z + min_h] * len(nodes)
+                # Elevated part (e.g. upper floors tagged with min_height):
+                # flat base at anchor + min_height.
+                base_zs = [anchor_z + min_h + _BUILDING_Z_BIAS] * len(nodes)
             else:
-                # Ground-level building: base follows terrain (no sinking)
-                base_zs = corner_zs
+                # Ground-level building: extend base _FOUNDATION_DEPTH below
+                # terrain at each corner.  The terrain mesh (opaque, depth-
+                # tested) occludes the underground portion, so the wall
+                # appears to rise naturally from the surface on any slope.
+                base_zs = [z - _FOUNDATION_DEPTH for z in corner_zs]
 
-            # 5. Roof geometry
+            # 5. Roof geometry — plate height based on anchor.
             plate_z = anchor_z + min_h + wall_h
             top_zs, roof_extra_verts, roof_extra_faces = self._build_roof(
                 local_xy, plate_z, roof_h, tags
@@ -673,38 +695,36 @@ class BuildingExtruder:
         Hemispherical dome or onion dome, built as DOME_RINGS latitude rings
         of n vertices each, tapering to a central apex.
 
-        The ring vertices are evenly spaced circles in local metric space
-        centred at the polygon centroid.  For building:shape=cylinder footprints
-        (already ~circular) this gives a smooth rounded cap.
+        Each ring vertex is placed in the SAME angular direction from the
+        centroid as the corresponding base polygon vertex, just scaled radially
+        inward.  This guarantees that ring vertex k connects correctly to base
+        vertex k without face twisting, regardless of footprint shape.
         """
-        xs    = [p[0] for p in top_xy]
-        ys    = [p[1] for p in top_xy]
-        cx    = (min(xs) + max(xs)) / 2
-        cy    = (min(ys) + max(ys)) / 2
-        base_r = max(0.1, min((max(xs) - min(xs)) / 2,
-                               (max(ys) - min(ys)) / 2))
+        cx = sum(p[0] for p in top_xy) / n
+        cy = sum(p[1] for p in top_xy) / n
 
         extra_verts: list[tuple] = []
-        ring_starts: list[int]   = []   # index in extra_verts where each ring starts
+        ring_starts: list[int]   = []
 
         for ring_i in range(1, DOME_RINGS + 1):
             frac  = ring_i / DOME_RINGS
             angle = math.pi / 2 * frac
 
             if profile == "onion":
-                # Swell out before 40 % height, then taper
-                bulge = 1.0 + 0.35 * math.sin(math.pi * min(frac / 0.4, 1.0))
-                r     = base_r * bulge * math.cos(angle)
+                bulge  = 1.0 + 0.35 * math.sin(math.pi * min(frac / 0.4, 1.0))
+                r_scale = bulge * math.cos(angle)
             else:
-                r = base_r * math.cos(angle)
+                r_scale = math.cos(angle)
 
             z = plate_z + roof_height * math.sin(angle)
 
             ring_starts.append(len(extra_verts))
-            for seg in range(n):
-                theta = 2 * math.pi * seg / n
-                extra_verts.append((cx + r * math.cos(theta),
-                                    cy + r * math.sin(theta),
+            for px, py in top_xy:
+                dx, dy = px - cx, py - cy
+                # Scale each base vertex toward the centroid by r_scale.
+                # This preserves angular alignment so face connections are valid.
+                extra_verts.append((cx + dx * r_scale,
+                                    cy + dy * r_scale,
                                     z))
 
         # Apex

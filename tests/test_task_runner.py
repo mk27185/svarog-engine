@@ -2,7 +2,7 @@ import json
 import os
 import pytest
 
-from src.pipeline.tile_manifest import TileManifest
+from src.pipeline.tile_manifest import TileManifest, TilesetDescriptor
 from src.pipeline.task_runner import TaskRunner, TileConfig
 from src.pipeline.terrain_pipeline import TerrainPipeline
 from src.conversion.terrain_converter import TerrainConverter
@@ -185,6 +185,60 @@ class TestTaskRunner:
         t = manifest.tiles[0]
         assert t["status"] == "failed"
         assert "error" in t
+
+    def test_run_produces_tileset_json(
+            self, mock_opentopography, mock_osm_client, tmp_output):
+        """TaskRunner must write tileset.json alongside tile-manifest.json."""
+        pipeline = self._make_pipeline(tmp_output, mock_opentopography,
+                                       mock_osm_client)
+        from src.conversion.gltf_exporter import GltfExporter
+        pipeline.gltf_exporter = GltfExporter(output_dir=tmp_output)
+
+        runner = TaskRunner(pipeline=pipeline, output_root=tmp_output)
+        tiles = [
+            TileConfig(name="t_a", bbox=(50.07, 14.43, 50.08, 14.44)),
+            TileConfig(name="t_b", bbox=(50.08, 14.43, 50.09, 14.44)),
+        ]
+        manifest_path = os.path.join(tmp_output, "tile-manifest.json")
+        summary = runner.run(tiles, manifest_path=manifest_path)
+
+        tileset_path = os.path.join(tmp_output, "tileset.json")
+        assert os.path.exists(tileset_path), "tileset.json was not created"
+        assert summary["tileset"] == tileset_path
+
+        with open(tileset_path) as f:
+            ts = json.load(f)
+
+        assert ts["tilejson"] == "3.0.0"
+        assert ts["minzoom"] == ts["maxzoom"] == runner.zoom
+        assert len(ts["bounds"]) == 4
+        # Union bounds must span both tiles
+        lon_w, lat_s, lon_e, lat_n = ts["bounds"]
+        assert lat_s <= 50.07 and lat_n >= 50.09
+        assert lon_w <= 14.43 and lon_e >= 14.44
+
+    def test_tileset_extras_contain_elev_and_sdf(
+            self, mock_opentopography, mock_osm_client, tmp_output):
+        """tileset.json extras must aggregate elev_min/max across all tiles."""
+        pipeline = self._make_pipeline(tmp_output, mock_opentopography,
+                                       mock_osm_client)
+        from src.conversion.gltf_exporter import GltfExporter
+        pipeline.gltf_exporter = GltfExporter(output_dir=tmp_output)
+
+        runner = TaskRunner(pipeline=pipeline, output_root=tmp_output)
+        tiles = [TileConfig(name="elev_t", bbox=(50.07, 14.43, 50.08, 14.44))]
+        manifest_path = os.path.join(tmp_output, "tile-manifest.json")
+        runner.run(tiles, manifest_path=manifest_path)
+
+        with open(os.path.join(tmp_output, "tileset.json")) as f:
+            ts = json.load(f)
+
+        extras = ts.get("extras", {})
+        assert "has_sdf" in extras
+        assert isinstance(extras.get("has_sdf"), bool)
+        # elev_min/max are written when pipeline returns them
+        if extras.get("elev_min") is not None:
+            assert extras["elev_min"] <= extras["elev_max"]
 
     def test_stop_on_error_aborts_remaining(
             self, mock_opentopography, mock_osm_client, tmp_output):

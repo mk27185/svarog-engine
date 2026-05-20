@@ -1,32 +1,13 @@
 """
-svarog-engine CLI
-=================
-Run from the **svarog-engine** repo root (venv active)::
+CLI entry with batched Overpass (v2) for multi-tile bbox / YAML batches.
 
-    python -m src --help
+Run from repo root::
 
-The importable top-level package directory is ``src/``, so ``python -m src`` is
-the module Python executes via ``src/__main__.py``. There is no installed
-package named ``svarog_engine`` unless you add your own setuptools layout.
+    python -m src.cli_overpass_v2 --bbox "49.43,14.11,50.10,15.07" --output outputs/run/
 
-Examples
---------
-    # Bbox — tile size comes from svarog-contracts/world-config.json
-    python -m src --bbox "50.07,14.43,50.09,14.46" --output outputs/test/
+Legacy single-tile / per-tile Overpass remains::
 
-    # Single XYZ tile (explicit z/x/y)
-    python -m src --tile 15/17698/11100 --output outputs/test/
-
-    # Batch config YAML
-    python -m src --config tiles.yaml
-
-    # Override tile size or Draco for this run only
-    python -m src --bbox "50.07,14.43,50.09,14.46" --tile-size 200 --draco --output outputs/
-
-    # Force re-download of OSM data even when a cache exists
-    python -m src --tile 15/17698/11100 --force-osm --output outputs/test/
-
-Options override world-config.json from svarog-contracts where applicable.
+    python -m src ...
 """
 from __future__ import annotations
 
@@ -37,8 +18,11 @@ import sys
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="python -m src",
-        description="Generate terrain GLB tiles from OpenTopography + OSM data.",
+        prog="python -m src.cli_overpass_v2",
+        description=(
+            "Generate terrain GLB tiles — multi-tile batches use 2× Overpass "
+            "(union bbox) + local clip per tile. Single-tile runs behave like v1."
+        ),
     )
 
     area = parser.add_mutually_exclusive_group(required=False)
@@ -68,9 +52,7 @@ def main() -> None:
     parser.add_argument("--stop-on-error", action="store_true",
                         help="Abort batch on first failed tile")
     parser.add_argument("--force-osm", action="store_true",
-                        help="Re-download OSM data even when a cache exists")
-    parser.add_argument("--no-navmesh", action="store_true",
-                        help="Skip navmesh generation in GLB")
+                        help="Re-download OSM (union batch) even when per-tile cache exists")
 
     args = parser.parse_args()
 
@@ -107,13 +89,18 @@ def main() -> None:
 
     elif args.bbox:
         parts = [float(v) for v in args.bbox.split(",")]
-        if len(parts) != 4:
-            parser.error("--bbox must be S,W,N,E (4 values)")
-        tiles = TileSplitter.xyz_grid(tuple(parts), tile_size_m)
+        if len(parts) not in (4,):
+            parser.error("--bbox requires 4 comma-separated values: lat1,lon1,lat2,lon2")
+        # Accept any two-corner order — normalise to (south, west, north, east)
+        lats = sorted([parts[0], parts[2]])
+        lons = sorted([parts[1], parts[3]])
+        bbox = (lats[0], lons[0], lats[1], lons[1])
+        tiles = TileSplitter.xyz_grid(bbox, tile_size_m)
         zoom = TileSplitter.zoom_for_tile_size(tile_size_m,
-                                               lat=(parts[0] + parts[2]) / 2)
+                                               lat=(bbox[0] + bbox[2]) / 2)
         print(f"bbox → {len(tiles)} tile(s)  "
-              f"(tile_size_m={tile_size_m} → zoom {zoom})")
+              f"(tile_size_m={tile_size_m} → zoom {zoom})  "
+              f"[S={bbox[0]}, W={bbox[1]}, N={bbox[2]}, E={bbox[3]}]")
 
     if not tiles:
         sys.exit("No tiles to process.")
@@ -128,6 +115,7 @@ def main() -> None:
     from src.conversion.gltf_exporter import GltfExporter
     from src.pipeline.terrain_pipeline import TerrainPipeline
     from src.pipeline.task_runner import TaskRunner
+    from src.pipeline.task_runner_overpass_v2 import run_task_batch_overpass_v2
 
     pipeline = TerrainPipeline(
         client=OpenTopographyClient(),
@@ -140,14 +128,21 @@ def main() -> None:
         gltf_exporter=GltfExporter(output_dir=output_root, use_draco=use_draco),
         upsample_factor=upsample,
         osm_force_download=args.force_osm,
-        build_navmesh=not getattr(args, "no_navmesh", False),
     )
 
-    summary = TaskRunner(
-        pipeline=pipeline,
+    tile_zoom = tiles[0].xyz.z if tiles and tiles[0].xyz is not None else zoom
+    summary = run_task_batch_overpass_v2(
+        TaskRunner(
+            pipeline=pipeline,
+            output_root=output_root,
+            zoom=tile_zoom,
+            stop_on_error=args.stop_on_error,
+        ),
+        tiles=tiles,
+        manifest_path=os.path.join(output_root, "tile-manifest.json"),
         output_root=output_root,
-        stop_on_error=args.stop_on_error,
-    ).run(tiles, manifest_path=os.path.join(output_root, "tile-manifest.json"))
+        force_osm=args.force_osm,
+    )
 
     print(f"\nDone: {summary['completed']}/{summary['total']} tiles")
     print(f"Manifest: {summary['manifest']}")

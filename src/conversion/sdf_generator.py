@@ -111,16 +111,24 @@ class SDFGenerator:
                 ]
             else:
                 local_pts = [to_local(lon, lat, meta) for lon, lat in nodes]
-            pixel_pts = self._to_pixel(local_pts, meta)
-            if len(pixel_pts) < 2:
-                continue
 
-            roads.append({
-                "pixels": pixel_pts,
-                "half_w": padded_hw,
-                "raw_hw": half_w,
-                "rank": rank,
-            })
+            tw = meta["total_width_m"]
+            th = meta["total_height_m"]
+            clipped_segs = self._clip_polyline_to_bbox(
+                local_pts, 0.0, 0.0, tw, th
+            )
+
+            for seg in clipped_segs:
+                pixel_pts_list = self._to_pixel_uv(seg, meta)
+                if len(pixel_pts_list) < 2:
+                    continue
+                pixel_pts = np.array(pixel_pts_list, dtype=np.float32)
+                roads.append({
+                    "pixels": pixel_pts,
+                    "half_w": padded_hw,
+                    "raw_hw": half_w,
+                    "rank": rank,
+                })
             max_hw = max(max_hw, padded_hw)
 
         if not roads:
@@ -201,15 +209,120 @@ class SDFGenerator:
     # ---- helpers --------------------------------------------------
 
     @staticmethod
-    def _to_pixel(
-        local_pts: list[tuple[float, float]],
+    def _clip_polyline_to_bbox(
+        pts: list[tuple[float, float]],
+        x_min: float, y_min: float,
+        x_max: float, y_max: float,
+    ) -> list[list[tuple[float, float]]]:
+        """Clip a polyline to an axis-aligned bbox (Cohen–Sutherland).
+
+        Returns a list of clipped sub-polylines (a polyline can be split into
+        multiple segments when it re-enters the bbox after leaving it).
+        Points exactly on the intersection with the bbox boundary are inserted
+        so that roads always reach — and start from — the tile edge.
+        """
+        def _intersect_segment(
+            ax: float, ay: float, bx: float, by: float,
+            edge: str,
+        ) -> tuple[float, float]:
+            dx, dy = bx - ax, by - ay
+            if edge == "left":
+                t = (x_min - ax) / dx if dx else 0.0
+            elif edge == "right":
+                t = (x_max - ax) / dx if dx else 0.0
+            elif edge == "bottom":
+                t = (y_min - ay) / dy if dy else 0.0
+            else:  # top
+                t = (y_max - ay) / dy if dy else 0.0
+            return (ax + t * dx, ay + t * dy)
+
+        def _inside(x: float, y: float) -> bool:
+            return x_min <= x <= x_max and y_min <= y <= y_max
+
+        segments: list[list[tuple[float, float]]] = []
+        current: list[tuple[float, float]] = []
+
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            a_in = _inside(ax, ay)
+            b_in = _inside(bx, by)
+
+            if a_in and b_in:
+                # Both inside — just accumulate
+                if not current:
+                    current.append((ax, ay))
+                current.append((bx, by))
+                continue
+
+            # Find all edge crossings along segment a→b using parametric clipping
+            t_vals: list[tuple[float, str]] = []
+            for edge, (x0, x1, y0, y1) in [
+                ("left",   (x_min, x_min, y_min, y_max)),
+                ("right",  (x_max, x_max, y_min, y_max)),
+                ("bottom", (x_min, x_max, y_min, y_min)),
+                ("top",    (x_min, x_max, y_max, y_max)),
+            ]:
+                # Is the edge potentially crossed?
+                dx, dy = bx - ax, by - ay
+                if edge in ("left", "right"):
+                    if abs(dx) < 1e-12:
+                        continue
+                    t = (x0 - ax) / dx
+                    ix, iy = ax + t * dx, ay + t * dy
+                    if 0 < t < 1 and y0 <= iy <= y1:
+                        t_vals.append((t, edge))
+                else:
+                    if abs(dy) < 1e-12:
+                        continue
+                    t = (y0 - ay) / dy
+                    ix, iy = ax + t * dx, ay + t * dy
+                    if 0 < t < 1 and x0 <= ix <= x1:
+                        t_vals.append((t, edge))
+
+            t_vals.sort(key=lambda tv: tv[0])
+
+            # Build point list along segment including all crossing points
+            seg_pts: list[tuple[float, float, bool]] = []  # (x, y, inside)
+            seg_pts.append((ax, ay, a_in))
+            for t, edge in t_vals:
+                ix, iy = ax + t * (bx - ax), ay + t * (by - ay)
+                # Crossing point is on the boundary → consider it inside
+                seg_pts.append((ix, iy, True))
+            seg_pts.append((bx, by, b_in))
+
+            for j in range(len(seg_pts) - 1):
+                px, py, p_in = seg_pts[j]
+                qx, qy, q_in = seg_pts[j + 1]
+                # Draw this sub-segment only if both endpoints are "inside"
+                # (boundary points count as inside)
+                if p_in and q_in:
+                    if not current:
+                        current.append((px, py))
+                    elif current[-1] != (px, py):
+                        # Gap in coverage → save and restart
+                        if len(current) >= 2:
+                            segments.append(current)
+                        current = [(px, py)]
+                    current.append((qx, qy))
+                else:
+                    if len(current) >= 2:
+                        segments.append(current)
+                    current = []
+
+        if len(current) >= 2:
+            segments.append(current)
+        return segments
+
+    @staticmethod
+    def _to_pixel_uv(
+        pts: list[tuple[float, float]],
         meta: dict,
-    ) -> np.ndarray:
-        """(x_m, y_m) -> normalised (u, v) in [0, 1)."""
-        pts = np.array(local_pts, dtype=np.float32)
-        u = np.clip(pts[:, 0] / meta["total_width_m"], 0.0, 1.0)
-        v = np.clip(1.0 - pts[:, 1] / meta["total_height_m"], 0.0, 1.0)
-        return np.stack([u, v], axis=1)
+    ) -> list[tuple[float, float]]:
+        """(x_m, y_m) -> pixel fraction (u, v) in [0, 1]."""
+        tw = meta["total_width_m"]
+        th = meta["total_height_m"]
+        return [(x / tw, 1.0 - y / th) for x, y in pts]
 
     @staticmethod
     def _half_width(tags: dict) -> float:

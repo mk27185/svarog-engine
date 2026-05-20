@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .tile_manifest import TileManifest, _utc_now
+from .tile_manifest import TileManifest, TilesetDescriptor, _utc_now
 
 
 # ── Tile definition ───────────────────────────────────────────────────────────
@@ -98,11 +98,19 @@ class TaskRunner:
             "tiles":     [...]  # per-tile result dicts
           }
         """
+        # Derive the actual zoom from tile XYZ data when available —
+        # this overrides the constructor default (14) when tiles were generated
+        # at a different zoom level (e.g. zoom 17 for tile_size_m=200).
+        effective_zoom = self.zoom
+        if tiles and tiles[0].xyz is not None:
+            effective_zoom = tiles[0].xyz.z
+
         manifest = TileManifest(
             version=self.version,
-            zoom=self.zoom,
+            zoom=effective_zoom,
             layers=self.layers,
         )
+        tileset = TilesetDescriptor(zoom=effective_zoom, version=self.version)
 
         completed = 0
         failed    = 0
@@ -158,13 +166,22 @@ class TaskRunner:
                 output_base = str(tile.xyz.y) if tile.xyz else tile.name
                 result = self.pipeline.run_pipeline(tile.bbox, output_base)
                 outputs = {
-                    "terrain":     result.get("terrain"),
-                    "roads":       result.get("roads"),
-                    "buildings":   result.get("buildings"),
-                    "sdf_texture": result.get("sdf_texture"),
+                    "terrain":           result.get("terrain"),
+                    "roads":             result.get("roads"),
+                    "buildings":         result.get("buildings"),
+                    "sdf_texture":       result.get("sdf_texture"),
+                    "landcover_texture": result.get("landcover_texture"),
                 }
                 manifest.add_tile(tile.name, tile.bbox,
                                   status="completed", outputs=outputs)
+                tileset.add_tile(
+                    bbox=tile.bbox,
+                    elev_min=result.get("elev_min"),
+                    elev_max=result.get("elev_max"),
+                    has_sdf=result.get("sdf_texture") is not None,
+                    has_landcover=result.get("landcover_texture") is not None,
+                    has_navmesh=result.get("navmesh") is not None,
+                )
                 completed += 1
                 tile_summary = {"name": tile.name, "status": "completed",
                                 "outputs": outputs}
@@ -188,9 +205,21 @@ class TaskRunner:
             results.append(tile_summary)
 
         resolved = manifest.write(manifest_path)
+
+        tileset_path: str | None = None
+        if completed > 0:
+            ts_path = Path(manifest_path).with_name("tileset.json")
+            try:
+                tileset.write(ts_path)
+                tileset_path = str(ts_path)
+            except Exception as exc:
+                print(f"  ⚠ tileset.json se nepodařilo zapsat: {exc}")
+
         print(f"\n{'='*60}")
         print(f"  Batch hotov — {completed}/{len(tiles)} OK, {failed} selhalo")
-        print(f"  Manifest: {resolved}")
+        print(f"  Manifest:  {resolved}")
+        if tileset_path:
+            print(f"  Tileset:   {tileset_path}")
         print(f"{'='*60}\n")
 
         return {
@@ -198,5 +227,6 @@ class TaskRunner:
             "completed": completed,
             "failed":    failed,
             "manifest":  str(resolved),
+            "tileset":   tileset_path,
             "tiles":     results,
         }

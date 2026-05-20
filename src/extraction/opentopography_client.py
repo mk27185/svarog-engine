@@ -46,16 +46,23 @@ class OpenTopographyClient:
         self._cache_bbox = bbox
         return path
 
-    def get_dem(self, bbox: tuple, output_dir: str = "data/downloads") -> str | None:
+    def get_dem(
+        self,
+        bbox:       tuple,
+        output_dir: str = "data/downloads",
+        buffer_px:  int = 1,
+    ) -> str | None:
         """
         Return a TIF file for *bbox*.
 
         If a prefetched cache covers *bbox*, crops from it (no network request).
+        With buffer_px > 0 the crop is expanded by that many DEM pixels in every
+        direction so that terrain_converter can compute seamless boundary elevations.
         Otherwise downloads from OpenTopography directly.
         """
         if self._cache_path and self._bbox_covered(bbox):
             try:
-                return self._crop_from_cache(bbox, output_dir)
+                return self._crop_from_cache(bbox, output_dir, buffer_px=buffer_px)
             except Exception as e:
                 print(f"  Cache crop failed ({e}), falling back to download")
 
@@ -68,28 +75,55 @@ class OpenTopographyClient:
         cs, cw, cn, ce = self._cache_bbox
         return s >= cs and w >= cw and n <= cn and e <= ce
 
-    def _crop_from_cache(self, bbox: tuple, output_dir: str) -> str:
+    def _crop_from_cache(
+        self,
+        bbox:       tuple,
+        output_dir: str,
+        buffer_px:  int = 1,
+    ) -> str:
+        """Crop the cached DEM to *bbox*, optionally expanded by *buffer_px* pixels.
+
+        The extra pixels come from the neighbouring tiles' DEM area inside the
+        union cache.  terrain_converter uses this overlap to compute border vertex
+        elevations by TRUE bilinear interpolation rather than extrapolation, which
+        guarantees that adjacent tiles agree on their shared boundary elevation.
+        """
         s, w, n, e = bbox
-        fname = f"dem_{s:.6f}_{w:.6f}_{n:.6f}_{e:.6f}.tif"
-        out_path = os.path.join(output_dir, fname)
+        buf_sfx   = f"_buf{buffer_px}" if buffer_px else ""
+        fname     = f"dem_{s:.6f}_{w:.6f}_{n:.6f}_{e:.6f}{buf_sfx}.tif"
+        out_path  = os.path.join(output_dir, fname)
         os.makedirs(output_dir, exist_ok=True)
 
         if os.path.exists(out_path):
             return out_path
 
         with rasterio.open(self._cache_path) as src:
-            geom = box(w, s, e, n)
-            out_image, out_transform = rasterio.mask.mask(
-                src, [geom], crop=True, all_touched=True
-            )
+            # --- exact integer window for the tile bbox ----------------------
+            tile_win = rasterio.windows.from_bounds(w, s, e, n, src.transform)
+            r0 = round(tile_win.row_off)
+            c0 = round(tile_win.col_off)
+            r1 = round(tile_win.row_off + tile_win.height)
+            c1 = round(tile_win.col_off + tile_win.width)
+
+            # --- expand, clamped to the available raster extent --------------
+            r0 = max(0,          r0 - buffer_px)
+            c0 = max(0,          c0 - buffer_px)
+            r1 = min(src.height, r1 + buffer_px)
+            c1 = min(src.width,  c1 + buffer_px)
+
+            exp_win       = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+            data          = src.read(1, window=exp_win)
+            exp_transform = rasterio.windows.transform(exp_win, src.transform)
+
             out_meta = src.meta.copy()
             out_meta.update({
-                "height": out_image.shape[1],
-                "width":  out_image.shape[2],
-                "transform": out_transform,
+                "count": 1,
+                "height": int(exp_win.height),
+                "width":  int(exp_win.width),
+                "transform": exp_transform,
             })
             with rasterio.open(out_path, "w", **out_meta) as dst:
-                dst.write(out_image)
+                dst.write(data, 1)
 
         return out_path
 

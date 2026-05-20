@@ -114,6 +114,114 @@ class OsmClient:
         return self._parse_ways(elements, required_tag="highway")
 
     # ------------------------------------------------------------------
+    # Landcover (water, green, railways) — single Overpass query
+    # ------------------------------------------------------------------
+
+    _GREEN_LANDUSE = frozenset({
+        "grass", "forest", "meadow", "vineyard", "orchard", "recreation_ground",
+    })
+    _GREEN_LEISURE = frozenset({"park", "garden", "nature_reserve"})
+    _GREEN_NATURAL = frozenset({"wood", "scrub", "heath", "grassland"})
+    _WATERWAY_TAGS = frozenset({"river", "stream", "canal", "drain", "ditch"})
+
+    def get_landcover(self, bbox: tuple) -> dict[str, list]:
+        """
+        Fetch landcover features in one Overpass request.
+
+        Returns dict with keys:
+          water_polygons, waterways, green_polygons, railways
+        """
+        min_lat, min_lon, max_lat, max_lon = bbox
+        query = (
+            f"[out:json][timeout:90];\n"
+            f"(\n"
+            f'  way["natural"="water"]({min_lat},{min_lon},{max_lat},{max_lon});\n'
+            f'  way["landuse"="reservoir"]({min_lat},{min_lon},{max_lat},{max_lon});\n'
+            f'  way["water"]({min_lat},{min_lon},{max_lat},{max_lon});\n'
+            f'  way["waterway"]({min_lat},{min_lon},{max_lat},{max_lon});\n'
+            f'  way["landuse"~"^(grass|forest|meadow|vineyard|orchard|recreation_ground)$"]'
+            f"({min_lat},{min_lon},{max_lat},{max_lon});\n"
+            f'  way["leisure"~"^(park|garden|nature_reserve)$"]'
+            f"({min_lat},{min_lon},{max_lat},{max_lon});\n"
+            f'  way["natural"~"^(wood|scrub|heath|grassland)$"]'
+            f"({min_lat},{min_lon},{max_lat},{max_lon});\n"
+            f'  way["railway"]({min_lat},{min_lon},{max_lat},{max_lon});\n'
+            f");\n"
+            f"out body;>;out skel qt;"
+        )
+        elements = self._fetch(query, "landcover")
+        return self._parse_landcover(elements)
+
+    def _parse_landcover(self, elements: list[dict]) -> dict[str, list]:
+        _, way_nodes = self._build_indices(elements)
+
+        water_polygons: list[dict] = []
+        waterways: list[dict] = []
+        green_polygons: list[dict] = []
+        railways: list[dict] = []
+
+        for el in elements:
+            if el["type"] != "way":
+                continue
+            tags = el.get("tags", {})
+            nodes = list(way_nodes.get(el["id"], []))
+            if len(nodes) < 2:
+                continue
+            if len(nodes) > 1 and nodes[0] == nodes[-1]:
+                nodes = nodes[:-1]
+
+            item = {"id": el["id"], "nodes": nodes, "tags": tags}
+
+            if tags.get("natural") == "water" or tags.get("landuse") == "reservoir":
+                if len(nodes) >= 3:
+                    water_polygons.append(item)
+                continue
+            if tags.get("water") in ("lake", "pond", "basin"):
+                if len(nodes) >= 3:
+                    water_polygons.append(item)
+                continue
+
+            wwy = tags.get("waterway", "")
+            if wwy in self._WATERWAY_TAGS:
+                if len(nodes) >= 2:
+                    waterways.append(item)
+                continue
+
+            lu = tags.get("landuse", "")
+            if lu in self._GREEN_LANDUSE:
+                if len(nodes) >= 3:
+                    green_polygons.append(item)
+                continue
+            le = tags.get("leisure", "")
+            if le in self._GREEN_LEISURE:
+                if len(nodes) >= 3:
+                    green_polygons.append(item)
+                continue
+            nat = tags.get("natural", "")
+            if nat in self._GREEN_NATURAL:
+                if len(nodes) >= 3:
+                    green_polygons.append(item)
+                continue
+
+            if "railway" in tags:
+                if len(nodes) >= 2:
+                    railways.append(item)
+
+        result = {
+            "water_polygons": water_polygons,
+            "waterways":      waterways,
+            "green_polygons": green_polygons,
+            "railways":       railways,
+        }
+        total = sum(len(v) for v in result.values())
+        print(
+            f"   Landcover: {total} prvků "
+            f"(voda {len(water_polygons)}, řeky {len(waterways)}, "
+            f"zelen {len(green_polygons)}, železnice {len(railways)})"
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Internal – HTTP
     # ------------------------------------------------------------------
 

@@ -5,6 +5,7 @@ import struct
 import numpy as np
 import pytest
 import trimesh
+from PIL import Image
 
 from src.conversion.gltf_exporter import GltfExporter, _ZUPTOYUP
 
@@ -272,7 +273,8 @@ class TestGltfExtras:
         assert abs(svarog["sdf_uv_width_m"]  - 2 * cx) < 1e-3
         assert abs(svarog["sdf_uv_height_m"] - 2 * cy) < 1e-3
 
-    def test_extras_absent_without_tile_center(self, tmp_output):
+    def test_sdf_uv_dims_absent_without_tile_center(self, tmp_output):
+        """sdf_uv_width/height require tile_center_local; has_sdf is always written."""
         obj = os.path.join(tmp_output, "noex_terrain.obj")
         _write_minimal_obj(obj)
         exporter = GltfExporter(output_dir=tmp_output)
@@ -281,8 +283,43 @@ class TestGltfExtras:
             output_name="no_extras",
         )
         gltf_json = self._load_gltf_json(out)
-        extras = gltf_json["scenes"][0].get("extras")
-        assert extras is None
+        svarog = gltf_json["scenes"][0].get("extras", {}).get("svarog", {})
+        assert "sdf_uv_width_m"  not in svarog
+        assert "sdf_uv_height_m" not in svarog
+        # has_sdf is always present (defaults to False)
+        assert svarog.get("has_sdf") is False
+
+    def test_extras_elev_and_sdf_flag(self, tmp_output):
+        """elev_min, elev_max and has_sdf are written into scene.extras["svarog"]."""
+        obj = os.path.join(tmp_output, "elev_terrain.obj")
+        _write_minimal_obj(obj)
+        exporter = GltfExporter(output_dir=tmp_output)
+        out = exporter.export(
+            {"terrain": obj, "roads": None, "buildings": None},
+            output_name="elev_test",
+            tile_center_local=(50.0, 50.0),
+            elev_min=241.5,
+            elev_max=278.3,
+            has_sdf=True,
+        )
+        gltf_json = self._load_gltf_json(out)
+        svarog = gltf_json["scenes"][0]["extras"]["svarog"]
+        assert abs(svarog["elev_min"] - 241.5) < 0.01
+        assert abs(svarog["elev_max"] - 278.3) < 0.01
+        assert svarog["has_sdf"] is True
+
+    def test_extras_has_sdf_false_by_default(self, tmp_output):
+        obj = os.path.join(tmp_output, "nosdf_terrain.obj")
+        _write_minimal_obj(obj)
+        exporter = GltfExporter(output_dir=tmp_output)
+        out = exporter.export(
+            {"terrain": obj, "roads": None, "buildings": None},
+            output_name="nosdf_test",
+            tile_center_local=(50.0, 50.0),
+        )
+        gltf_json = self._load_gltf_json(out)
+        svarog = gltf_json["scenes"][0]["extras"]["svarog"]
+        assert svarog["has_sdf"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +376,68 @@ class TestTexcoord0:
 # ─────────────────────────────────────────────────────────────────────────────
 # Draco
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmbeddedTextures:
+
+    def _load_gltf_json(self, glb_path: str) -> dict:
+        with open(glb_path, "rb") as f:
+            f.read(12)
+            chunk_length = struct.unpack("<I", f.read(4))[0]
+            f.read(4)
+            return json.loads(f.read(chunk_length).rstrip(b"\x00"))
+
+    def test_embedded_sdf_texture_in_glb(self, tmp_output):
+        obj = os.path.join(tmp_output, "emb_terrain.obj")
+        _write_minimal_obj(obj)
+        png = os.path.join(tmp_output, "emb_sdf.png")
+        Image.new("RGBA", (8, 8), (128, 64, 32, 255)).save(png)
+
+        exporter = GltfExporter(output_dir=tmp_output)
+        out = exporter.export(
+            {"terrain": obj, "roads": None, "buildings": None, "sdf_texture": png},
+            output_name="emb_test",
+            tile_center_local=(50.0, 50.0),
+            has_sdf=True,
+        )
+        gltf_json = self._load_gltf_json(out)
+        assert len(gltf_json.get("images", [])) == 1
+        assert len(gltf_json.get("textures", [])) == 1
+
+        terrain_mat = None
+        for mesh in gltf_json["meshes"]:
+            if mesh.get("name") == "terrain":
+                mat_idx = mesh["primitives"][0]["material"]
+                terrain_mat = gltf_json["materials"][mat_idx]
+                break
+        assert terrain_mat is not None
+        pbr = terrain_mat["pbrMetallicRoughness"]
+        assert "baseColorTexture" in pbr
+
+        svarog = gltf_json["scenes"][0]["extras"]["svarog"]
+        assert svarog.get("sdf_embedded") is True
+        assert "texture_roads" in svarog
+
+    def test_navmesh_extension(self, tmp_output):
+        obj = os.path.join(tmp_output, "nm_terrain.obj")
+        _write_minimal_obj(obj)
+        verts = np.array([[-50, -50, 0], [50, -50, 0], [50, 50, 0], [-50, 50, 0]], dtype=np.float32)
+        indices = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+        exporter = GltfExporter(output_dir=tmp_output)
+        out = exporter.export(
+            {"terrain": obj, "roads": None, "buildings": None,
+             "navmesh": {"vertices": verts, "indices": indices, "walkable_area_m2": 10000}},
+            output_name="nm_test",
+            tile_center_local=(50.0, 50.0),
+        )
+        gltf_json = self._load_gltf_json(out)
+        scene = gltf_json["scenes"][0]
+        assert "extensions" in scene
+        assert "EXT_svarog_navmesh" in scene["extensions"]
+        ext = scene["extensions"]["EXT_svarog_navmesh"]
+        assert ext["version"] == 1
+        svarog = scene.get("extras", {}).get("svarog", {})
+        assert svarog.get("has_navmesh") is True
+
 
 class TestDraco:
 

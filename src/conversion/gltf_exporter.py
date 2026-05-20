@@ -56,8 +56,8 @@ renderer or tool can reconstruct UV or tile placement without the manifest:
 
 Draco path
 ----------
-export_draco() currently does not embed TEXCOORD_0 (DracoPy encodes geometry
-only).  Use export() for the full-featured non-compressed path.
+export_draco() stores TEXCOORD_0 uncompressed alongside Draco geometry and
+embeds PNG textures (roads SDF, landcover) in the GLB binary.
 """
 from __future__ import annotations
 
@@ -67,7 +67,12 @@ from typing import Any
 
 import numpy as np
 import trimesh
-import trimesh.visual.material as tvm
+
+from src.conversion.gltf_assembly import (
+    GlbAssembly,
+    embedded_textures_from_result,
+    read_png_bytes,
+)
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 _COLOURS: dict[str, list[float]] = {
@@ -107,6 +112,11 @@ class GltfExporter:
         *,
         layer_colours:     dict[str, list[float]] | None = None,
         tile_center_local: tuple[float, float] | None = None,
+        elev_min:          float | None = None,
+        elev_max:          float | None = None,
+        has_sdf:           bool = False,
+        embedded_textures: dict[str, str | bytes] | None = None,
+        navmesh:           dict[str, Any] | None = None,
     ) -> str:
         """
         Build a combined GLB from *result* (from TerrainPipeline.run_pipeline).
@@ -117,10 +127,21 @@ class GltfExporter:
         tile_center_local : (cx_m, cy_m) where cx = total_width_m / 2.
                             Required for exact UV alignment and tile stitching.
                             Falls back to AABB if omitted (less precise).
+        elev_min          : minimum terrain elevation in metres (written to scene.extras)
+        elev_max          : maximum terrain elevation in metres (written to scene.extras)
+        has_sdf           : True when a _roads_sdf.png was generated for this tile
+        embedded_textures : PNG paths/bytes keyed roads_sdf / landcover (from result if None)
+        navmesh           : {"vertices": ndarray, "indices": ndarray, "walkable_area_m2": float}
         """
         colours   = {**_COLOURS, **(layer_colours or {})}
         meshes    = self._load_meshes(result, colours, tile_center_local, label="GLB")
-        glb_bytes = self._build_glb(meshes, colours, tile_center_local)
+        textures  = embedded_textures if embedded_textures is not None else embedded_textures_from_result(result)
+        glb_bytes = self._build_glb(
+            meshes, colours, tile_center_local,
+            elev_min=elev_min, elev_max=elev_max, has_sdf=has_sdf,
+            embedded_textures=textures,
+            navmesh=navmesh or result.get("navmesh"),
+        )
 
         out = self._resolve_output_path(output_name, output_path, result)
         Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -139,19 +160,28 @@ class GltfExporter:
         layer_colours:     dict[str, list[float]] | None = None,
         quantization_bits: int = 14,
         tile_center_local: tuple[float, float] | None = None,
+        elev_min:          float | None = None,
+        elev_max:          float | None = None,
+        has_sdf:           bool = False,
+        embedded_textures: dict[str, str | bytes] | None = None,
+        navmesh:           dict[str, Any] | None = None,
     ) -> str:
         """
         Same as export() but with KHR_draco_mesh_compression (~70–90 % smaller).
         Three.js requires DRACOLoader alongside GLTFLoader.
-        Note: TEXCOORD_0 is not included in the Draco path.
+        TEXCOORD_0 for terrain is stored uncompressed alongside Draco geometry.
         """
-        import DracoPy    # noqa: PLC0415
-        import pygltflib  # noqa: PLC0415
-
         colours = {**_COLOURS, **(layer_colours or {})}
         meshes  = self._load_meshes(result, colours, tile_center_local,
                                     label="GLB(Draco)")
-        glb_bytes = self._build_draco_glb(meshes, colours, quantization_bits)
+        textures = embedded_textures if embedded_textures is not None else embedded_textures_from_result(result)
+        glb_bytes = self._build_draco_glb(
+            meshes, colours, quantization_bits,
+            tile_center_local=tile_center_local,
+            elev_min=elev_min, elev_max=elev_max, has_sdf=has_sdf,
+            embedded_textures=textures,
+            navmesh=navmesh or result.get("navmesh"),
+        )
 
         out = self._resolve_output_path(output_name, output_path, result)
         Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -277,13 +307,18 @@ class GltfExporter:
         meshes:            list[tuple[str, trimesh.Trimesh]],
         colours:           dict[str, list[float]],
         tile_center_local: tuple[float, float] | None = None,
+        *,
+        elev_min:          float | None = None,
+        elev_max:          float | None = None,
+        has_sdf:           bool = False,
+        embedded_textures: dict[str, str | bytes] | None = None,
+        navmesh:           dict[str, Any] | None = None,
     ) -> bytes:
         """
         Build an uncompressed GLB using pygltflib.
 
         Terrain gets POSITION + TEXCOORD_0 (UV baked from cx/cy).
-        All other layers get POSITION only.
-        GLTF scene.extras carries the authoritative tile dimensions.
+        Embedded PNG textures are stored as glTF images (roads SDF on terrain material).
         """
         import pygltflib  # noqa: PLC0415
 
@@ -292,55 +327,13 @@ class GltfExporter:
         if tile_center_local is not None:
             cx, cy = tile_center_local
 
-        gltf_nodes       : list[pygltflib.Node]      = []
-        gltf_meshes      : list[pygltflib.Mesh]       = []
-        gltf_accessors   : list[pygltflib.Accessor]   = []
-        gltf_bufferviews : list[pygltflib.BufferView] = []
-        gltf_materials   : list[pygltflib.Material]   = []
-        binary_blobs     : list[bytes]                = []
-        byte_offset      = 0
+        asm = GlbAssembly()
+        texture_indices: dict[str, int] = {}
+        if embedded_textures:
+            for tex_name, source in embedded_textures.items():
+                texture_indices[tex_name] = asm.embed_png(read_png_bytes(source))
 
-        def _append_view(data: bytes) -> int:
-            nonlocal byte_offset
-            idx = len(gltf_bufferviews)
-            gltf_bufferviews.append(
-                pygltflib.BufferView(buffer=0, byteOffset=byte_offset,
-                                     byteLength=len(data))
-            )
-            binary_blobs.append(data)
-            byte_offset += len(data)
-            return idx
-
-        def _acc_vec3(arr: np.ndarray) -> int:
-            f32 = arr.astype(np.float32)
-            bv  = _append_view(f32.tobytes())
-            idx = len(gltf_accessors)
-            gltf_accessors.append(pygltflib.Accessor(
-                bufferView=bv, componentType=pygltflib.FLOAT, type=pygltflib.VEC3,
-                count=len(f32), min=f32.min(axis=0).tolist(),
-                max=f32.max(axis=0).tolist(),
-            ))
-            return idx
-
-        def _acc_vec2(arr: np.ndarray) -> int:
-            f32 = arr.astype(np.float32)
-            bv  = _append_view(f32.tobytes())
-            idx = len(gltf_accessors)
-            gltf_accessors.append(pygltflib.Accessor(
-                bufferView=bv, componentType=pygltflib.FLOAT, type=pygltflib.VEC2,
-                count=len(f32),
-            ))
-            return idx
-
-        def _acc_indices(faces: np.ndarray) -> int:
-            flat = faces.astype(np.uint32).flatten()
-            bv   = _append_view(flat.tobytes())
-            idx  = len(gltf_accessors)
-            gltf_accessors.append(pygltflib.Accessor(
-                bufferView=bv, componentType=pygltflib.UNSIGNED_INT,
-                type=pygltflib.SCALAR, count=len(flat),
-            ))
-            return idx
+        roads_tex = texture_indices.get("roads_sdf")
 
         for mesh_idx, (name, mesh) in enumerate(meshes):
             if name == "terrain" and cx is not None:
@@ -349,60 +342,89 @@ class GltfExporter:
             verts = mesh.vertices.astype(np.float32)
             faces = mesh.faces.astype(np.uint32)
 
-            pos_acc = _acc_vec3(verts)
-            idx_acc = _acc_indices(faces)
+            pos_acc = asm.acc_vec3(verts)
+            idx_acc = asm.acc_indices(faces)
 
             if name == "terrain":
-                uv_acc = _acc_vec2(GltfExporter._terrain_uv(verts, cx, cy))
+                uv_acc = asm.acc_vec2(GltfExporter._terrain_uv(verts, cx, cy))
                 attrs  = pygltflib.Attributes(POSITION=pos_acc, TEXCOORD_0=uv_acc)
             else:
                 attrs  = pygltflib.Attributes(POSITION=pos_acc)
 
-            colour  = colours.get(name, [0.5, 0.5, 0.5, 1.0])
-            mat_idx = len(gltf_materials)
-            gltf_materials.append(pygltflib.Material(
-                name=name,
-                pbrMetallicRoughness=pygltflib.PbrMetallicRoughness(
+            colour = colours.get(name, [0.5, 0.5, 0.5, 1.0])
+            if name == "terrain" and roads_tex is not None:
+                pbr = pygltflib.PbrMetallicRoughness(
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                    baseColorTexture=pygltflib.TextureInfo(index=roads_tex),
+                    metallicFactor=0.0, roughnessFactor=1.0,
+                )
+            else:
+                pbr = pygltflib.PbrMetallicRoughness(
                     baseColorFactor=colour, metallicFactor=0.0, roughnessFactor=1.0,
-                ),
-                doubleSided=True,
+                )
+
+            mat_idx = len(asm.materials)
+            asm.materials.append(pygltflib.Material(
+                name=name, pbrMetallicRoughness=pbr, doubleSided=True,
             ))
-            gltf_meshes.append(pygltflib.Mesh(
+            asm.meshes.append(pygltflib.Mesh(
                 name=name,
                 primitives=[pygltflib.Primitive(
                     attributes=attrs, indices=idx_acc, material=mat_idx,
                 )],
             ))
-            gltf_nodes.append(pygltflib.Node(
+            asm.nodes.append(pygltflib.Node(
                 name=name, mesh=mesh_idx, matrix=_ZUPTOYUP_COL,
             ))
 
-        root_idx = len(gltf_nodes)
-        gltf_nodes.append(pygltflib.Node(
+        root_idx = len(asm.nodes)
+        asm.nodes.append(pygltflib.Node(
             name="world", children=list(range(len(meshes))),
         ))
 
-        # Self-describing extras: tile dimensions for UV reconstruction / tooling
-        extras: dict | None = None
-        if cx is not None:
-            extras = {"svarog": {"sdf_uv_width_m": round(2.0 * cx, 6),
-                                  "sdf_uv_height_m": round(2.0 * cy, 6)}}  # type: ignore[operator]
+        if navmesh:
+            asm.attach_navmesh(
+                np.asarray(navmesh["vertices"]),
+                np.asarray(navmesh["indices"]),
+                walkable_area_m2=navmesh.get("walkable_area_m2"),
+            )
 
-        binary_blob = b"".join(binary_blobs)
-        gltf = pygltflib.GLTF2(
-            scene=0,
-            scenes=[pygltflib.Scene(
-                name="scene", nodes=[root_idx], extras=extras,
-            )],
-            nodes=gltf_nodes,
-            meshes=gltf_meshes,
-            accessors=gltf_accessors,
-            bufferViews=gltf_bufferviews,
-            materials=gltf_materials,
-            buffers=[pygltflib.Buffer(byteLength=len(binary_blob))],
+        has_navmesh = bool(asm.scene_extensions.get("EXT_svarog_navmesh"))
+        svarog_extras = GltfExporter._svarog_extras(
+            cx, cy, elev_min, elev_max, has_sdf, texture_indices,
+            has_navmesh=has_navmesh,
         )
-        gltf.set_binary_blob(binary_blob)
-        return b"".join(gltf.save_to_bytes())
+        extras: dict | None = {"svarog": svarog_extras} if svarog_extras else None
+        return asm.finalize_glb(root_idx, extras=extras)
+
+    @staticmethod
+    def _svarog_extras(
+        cx: float | None,
+        cy: float | None,
+        elev_min: float | None,
+        elev_max: float | None,
+        has_sdf: bool,
+        texture_indices: dict[str, int],
+        *,
+        has_navmesh: bool = False,
+    ) -> dict:
+        svarog: dict = {"has_sdf": has_sdf}
+        if cx is not None:
+            svarog["sdf_uv_width_m"]  = round(2.0 * cx, 6)
+            svarog["sdf_uv_height_m"] = round(2.0 * cy, 6)  # type: ignore[operator]
+        if elev_min is not None:
+            svarog["elev_min"] = round(elev_min, 2)
+        if elev_max is not None:
+            svarog["elev_max"] = round(elev_max, 2)
+        if "roads_sdf" in texture_indices:
+            svarog["sdf_embedded"] = True
+            svarog["texture_roads"] = texture_indices["roads_sdf"]
+        if "landcover" in texture_indices:
+            svarog["has_landcover"] = True
+            svarog["texture_landcover"] = texture_indices["landcover"]
+        if has_navmesh:
+            svarog["has_navmesh"] = True
+        return svarog
 
     # ── GLB builder (Draco) ───────────────────────────────────────────────────
 
@@ -411,85 +433,129 @@ class GltfExporter:
         meshes:            list[tuple[str, trimesh.Trimesh]],
         colours:           dict[str, list[float]],
         quantization_bits: int,
+        *,
+        tile_center_local: tuple[float, float] | None = None,
+        elev_min:          float | None = None,
+        elev_max:          float | None = None,
+        has_sdf:           bool = False,
+        embedded_textures: dict[str, str | bytes] | None = None,
+        navmesh:           dict[str, Any] | None = None,
     ) -> bytes:
-        """Build a KHR_draco_mesh_compression GLB (geometry only, no TEXCOORD_0)."""
+        """Build a KHR_draco_mesh_compression GLB with TEXCOORD_0 for terrain.
+
+        Per the KHR_draco_mesh_compression spec, attributes NOT listed in the
+        Draco extension may be stored as plain (uncompressed) buffer views.
+        TEXCOORD_0 is stored this way so the SDF road overlay works correctly.
+        tile_center_local: (cx_m, cy_m) — required for correct XY snap and UV.
+        """
         import DracoPy    # noqa: PLC0415
         import pygltflib  # noqa: PLC0415
 
-        gltf_nodes       : list[pygltflib.Node]      = []
-        gltf_meshes      : list[pygltflib.Mesh]       = []
-        gltf_accessors   : list[pygltflib.Accessor]   = []
-        gltf_bufferviews : list[pygltflib.BufferView] = []
-        gltf_materials   : list[pygltflib.Material]   = []
-        binary_blobs     : list[bytes]                = []
-        byte_offset      = 0
+        asm = GlbAssembly()
+        asm.extensions_used.append("KHR_draco_mesh_compression")
+
+        texture_indices: dict[str, int] = {}
+        if embedded_textures:
+            for tex_name, source in embedded_textures.items():
+                texture_indices[tex_name] = asm.embed_png(read_png_bytes(source))
+        roads_tex = texture_indices.get("roads_sdf")
+
+        cx_snap: float | None = tile_center_local[0] if tile_center_local else None
+        cy_snap: float | None = tile_center_local[1] if tile_center_local else None
+        cx_uv = cx_snap
+        cy_uv = cy_snap
 
         for mesh_idx, (name, mesh) in enumerate(meshes):
+            if name == "terrain" and cx_snap is not None:
+                GltfExporter._snap_boundary_vertices(mesh, cx_snap, cy_snap)  # type: ignore[arg-type]
+
             verts = mesh.vertices.astype(np.float32)
             faces = mesh.faces.astype(np.uint32)
 
             draco_bytes = bytes(DracoPy.encode(
                 verts, faces, quantization_bits=quantization_bits,
             ))
-            bv_idx = len(gltf_bufferviews)
-            gltf_bufferviews.append(pygltflib.BufferView(
-                buffer=0, byteOffset=byte_offset, byteLength=len(draco_bytes),
-            ))
-            binary_blobs.append(draco_bytes)
-            byte_offset += len(draco_bytes)
+            bv_draco = asm.append_bytes(draco_bytes)
 
-            pos_acc = len(gltf_accessors)
-            gltf_accessors.append(pygltflib.Accessor(
+            pos_acc = len(asm.accessors)
+            asm.accessors.append(pygltflib.Accessor(
                 componentType=pygltflib.FLOAT, type=pygltflib.VEC3,
                 count=len(verts),
                 min=verts.min(axis=0).tolist(), max=verts.max(axis=0).tolist(),
             ))
-            idx_acc = len(gltf_accessors)
-            gltf_accessors.append(pygltflib.Accessor(
+            idx_acc = len(asm.accessors)
+            asm.accessors.append(pygltflib.Accessor(
                 componentType=pygltflib.UNSIGNED_INT, type=pygltflib.SCALAR,
                 count=int(len(faces) * 3),
             ))
 
-            colour  = colours.get(name, [0.5, 0.5, 0.5, 1.0])
-            mat_idx = len(gltf_materials)
-            gltf_materials.append(pygltflib.Material(
-                name=name,
-                pbrMetallicRoughness=pygltflib.PbrMetallicRoughness(
+            colour = colours.get(name, [0.5, 0.5, 0.5, 1.0])
+            if name == "terrain" and roads_tex is not None:
+                pbr = pygltflib.PbrMetallicRoughness(
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                    baseColorTexture=pygltflib.TextureInfo(index=roads_tex),
+                    metallicFactor=0.0, roughnessFactor=1.0,
+                )
+            else:
+                pbr = pygltflib.PbrMetallicRoughness(
                     baseColorFactor=colour, metallicFactor=0.0, roughnessFactor=1.0,
-                ),
-                doubleSided=True,
+                )
+            mat_idx = len(asm.materials)
+            asm.materials.append(pygltflib.Material(
+                name=name, pbrMetallicRoughness=pbr, doubleSided=True,
             ))
-            gltf_meshes.append(pygltflib.Mesh(
+
+            # ── TEXCOORD_0 reordered to match Draco vertex order ─────────────
+            # Draco reorders vertices during compression.  We decode the just-
+            # encoded bytes, find the mapping from decoded→original vertices via
+            # nearest-neighbour lookup (quantisation error < 0.02 m), then
+            # permute the UV array so it aligns with the decoded vertex order.
+            prim_attrs = pygltflib.Attributes(POSITION=pos_acc)
+            if name == "terrain":
+                from scipy.spatial import cKDTree  # noqa: PLC0415
+                uv_orig = GltfExporter._terrain_uv(verts, cx_uv, cy_uv)
+
+                decoded       = DracoPy.decode(draco_bytes)
+                draco_pts     = np.array(decoded.points, dtype=np.float32)
+                _, orig_idx   = cKDTree(verts).query(draco_pts)
+                uv_reordered  = uv_orig[orig_idx]
+                uv_acc = asm.acc_vec2(uv_reordered, byte_stride=8)
+                prim_attrs = pygltflib.Attributes(POSITION=pos_acc, TEXCOORD_0=uv_acc)
+
+            asm.meshes.append(pygltflib.Mesh(
                 name=name,
                 primitives=[pygltflib.Primitive(
-                    attributes=pygltflib.Attributes(POSITION=pos_acc),
+                    attributes=prim_attrs,
                     indices=idx_acc, material=mat_idx,
                     extensions={"KHR_draco_mesh_compression": {
-                        "bufferView": bv_idx, "attributes": {"POSITION": 0},
+                        "bufferView": bv_draco, "attributes": {"POSITION": 0},
                     }},
                 )],
             ))
-            gltf_nodes.append(pygltflib.Node(
+            asm.nodes.append(pygltflib.Node(
                 name=name, mesh=mesh_idx, matrix=_ZUPTOYUP_COL,
             ))
 
-        root_idx = len(gltf_nodes)
-        gltf_nodes.append(pygltflib.Node(
+        root_idx = len(asm.nodes)
+        asm.nodes.append(pygltflib.Node(
             name="root", children=list(range(len(meshes))),
         ))
 
-        binary_blob = b"".join(binary_blobs)
-        gltf = pygltflib.GLTF2(
-            scene=0,
-            scenes=[pygltflib.Scene(name="scene", nodes=[root_idx])],
-            nodes=gltf_nodes, meshes=gltf_meshes, accessors=gltf_accessors,
-            bufferViews=gltf_bufferviews, materials=gltf_materials,
-            buffers=[pygltflib.Buffer(byteLength=len(binary_blob))],
-            extensionsUsed=["KHR_draco_mesh_compression"],
-            extensionsRequired=["KHR_draco_mesh_compression"],
+        if navmesh:
+            asm.attach_navmesh(
+                np.asarray(navmesh["vertices"]),
+                np.asarray(navmesh["indices"]),
+                walkable_area_m2=navmesh.get("walkable_area_m2"),
+            )
+
+        has_navmesh = bool(asm.scene_extensions.get("EXT_svarog_navmesh"))
+        svarog_extras = GltfExporter._svarog_extras(
+            cx_snap, cy_snap, elev_min, elev_max, has_sdf, texture_indices,
+            has_navmesh=has_navmesh,
         )
-        gltf.set_binary_blob(binary_blob)
-        return b"".join(gltf.save_to_bytes())
+        return asm.finalize_glb(
+            root_idx, extras={"svarog": svarog_extras}, draco_required=True,
+        )
 
     # ── Output path resolution ────────────────────────────────────────────────
 
